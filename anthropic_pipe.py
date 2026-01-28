@@ -1,9 +1,9 @@
 """
-title: Anthropic API Integration
-author: Podden (https://github.com/Podden/)
-github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
+title: Anthropic API Integration (Azure Compatible)
+author: DanCarrollAI (https://github.com/DanCarrollAI)
+based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.12
+version: 0.5.12-azure.2
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -28,10 +28,31 @@ Supports:
 - Context Editing (clear tool results and thinking blocks)
 - Tool Search (BM25/Regex)
 - Native PDF Upload (visual PDF analysis with charts/images)
+- Azure Anthropic API compatibility (date suffix stripping for model names)
+
+Azure Modifications by DanCarrollAI:
+- Added Azure Anthropic API compatibility
+- Model name date suffix stripping for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+- Added ANTHROPIC_API_BASE valve for custom endpoints (Azure, proxies)
+- Added ENABLED_MODELS valve to specify only deployed models (prevents auto-population of all models)
+- Changed default UserValves: ENABLE_THINKING=True, THINKING_BUDGET_TOKENS=20000, WEB_SEARCH_MAX_USES=8
+- Max tool call logic: requests final summary instead of abruptly stopping
+- Builtin tools (search_web, fetch_url) respect OpenWebUI web search toggle
+- Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 
 Changelog:
-v0.5.12
-- Thinking is now streamed in the UI and folded when the thought process has ended
+v0.5.12-azure.2
+- Added: Builtin tools (search_web, fetch_url) now respect the OpenWebUI web search toggle
+  - When toggle is OFF, these tools are filtered from the builtin tools registry
+  - Prevents accidental web tool execution when users have web search disabled
+- Added: SHOW_BUILTIN_TOOL_RESULTS valve (default: False)
+  - When False, tool results are fed to model silently (cleaner chat experience)
+  - When True, tool results display as expandable JSON in chat (for debugging)
+
+v0.5.12-azure.1
+- Rebased Azure changes onto Podden's 0.5.12
+- Includes OpenWebUI 0.7.x builtin tools compatibility from upstream
+- Includes streaming thinking improvements from upstream
 
 v0.5.11
 - Added Compatibility to Build-in Tools from OpenWebUI 0.7.x 
@@ -484,6 +505,14 @@ class Pipe:
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
+        ANTHROPIC_API_BASE: str = Field(
+            default="https://api.anthropic.com",
+            description="Base URL for Anthropic API. For Azure: https://<resource>.cognitiveservices.azure.com/anthropic",
+        )
+        ENABLED_MODELS: str = Field(
+            default="",
+            description="Comma-separated list of model names to enable (e.g., 'claude-sonnet-4,claude-opus-4'). Leave empty to auto-fetch from API or use all static models.",
+        )
         # ENABLE_CLAUDE_MEMORY: bool = Field(
         #     default=False,
         #     description="Enable Claude memory tool",
@@ -495,6 +524,10 @@ class Pipe:
         WEB_SEARCH: bool = Field(
             default=True,
             description="Enable web search tool for Claude models. Use Anthropic Web Search Toggle Function for fine grained control",
+        )
+        SHOW_BUILTIN_TOOL_RESULTS: bool = Field(
+            default=False,
+            description="Show builtin tool results (search_web, fetch_url) as expandable JSON in chat. When False, results are fed to model silently for cleaner chat experience.",
         )
         MAX_TOOL_CALLS: int = Field(
             default=15,
@@ -597,11 +630,11 @@ class Pipe:
 
     class UserValves(BaseModel):
         ENABLE_THINKING: bool = Field(
-            default=False,
+            default=True,
             description="Enable Extended Thinking",
         )
         THINKING_BUDGET_TOKENS: int = Field(
-            default=8192,
+            default=20000,
             ge=0,
             le=64000,
             description="Thinking budget tokens",
@@ -619,7 +652,7 @@ class Pipe:
             description="Show Context Window Progress",
         )
         WEB_SEARCH_MAX_USES: int = Field(
-            default=5,
+            default=8,
             ge=1,
             le=20,
             description="Maximum number of web searches",
@@ -653,13 +686,37 @@ class Pipe:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
         Fallback to static list on error. Returns OpenWebUI model dicts.
+
+        If ENABLED_MODELS valve is set, only returns those specific models.
         """
         from anthropic import AsyncAnthropic
 
         models = []
+
+        # If ENABLED_MODELS is specified, only return those models
+        if self.valves.ENABLED_MODELS.strip():
+            enabled_list = [m.strip() for m in self.valves.ENABLED_MODELS.split(",") if m.strip()]
+            for name in enabled_list:
+                info = self.get_model_info(name)
+                models.append(
+                    {
+                        "id": f"anthropic/{name}",
+                        "name": name,
+                        "context_length": info["context_length"],
+                        "supports_vision": info["supports_vision"],
+                        "supports_thinking": info["supports_thinking"],
+                        "is_hybrid_model": info["supports_thinking"],
+                        "max_output_tokens": info["max_tokens"],
+                        "info": {"meta": {"capabilities": {"status_updates": True}}},
+                    }
+                )
+            return models
+
         try:
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            client = AsyncAnthropic(
+                api_key=api_key, base_url=self.valves.ANTHROPIC_API_BASE
+            )
             async for m in client.models.list():
                 name = m.id
                 display_name = getattr(m, "display_name", name)
@@ -941,6 +998,8 @@ class Pipe:
         __files__: Optional[Dict[str, Any]] = None,
     ) -> tuple[dict, dict]:
         actual_model_name = body["model"].split("/")[-1]
+        # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+        actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
         model_info = self.get_model_info(actual_model_name)
         max_tokens_limit = model_info["max_tokens"]
         requested_max_tokens = body.get("max_tokens", max_tokens_limit)
@@ -1720,6 +1779,16 @@ class Pipe:
                     logger.warning(f"Could not load builtin tools: {e}")
                     builtin_tools = {}
 
+            # STEP 2.6: Gate builtin web tools by OpenWebUI's web search toggle
+            # When the toggle is OFF, remove search_web and fetch_url from builtin tools
+            features_web_search = __metadata__.get("features", {}).get("web_search", False) if __metadata__ else False
+            if not features_web_search and builtin_tools:
+                web_tools_to_remove = ["search_web", "fetch_url", "web_search"]
+                removed_tools = [t for t in web_tools_to_remove if t in builtin_tools]
+                if removed_tools:
+                    builtin_tools = {k: v for k, v in builtin_tools.items() if k not in web_tools_to_remove}
+                    logger.debug(f"Web search toggle OFF - removed builtin tools: {removed_tools}")
+
             # STEP 3: Auto-enable native function calling if tools are present
             # This prevents OpenWebUI's function_calling task system from being triggered
             if __tools__ and MODELS_AVAILABLE:
@@ -1767,7 +1836,11 @@ class Pipe:
             )
 
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
+            client = AsyncAnthropic(
+                api_key=api_key,
+                base_url=self.valves.ANTHROPIC_API_BASE,
+                default_headers=headers,
+            )
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
 
             # =========================================================================
@@ -2676,42 +2749,55 @@ class Pipe:
                                                         result_block["is_error"] = True
                                                     tool_calls.append(result_block)
 
-                                                    # Format and emit result to UI immediately
-                                                    try:
-                                                        parsed_json = json.loads(
-                                                            tool_result
-                                                        )
-                                                        formatted_result = f"```json\n{json.dumps(parsed_json, indent=2, ensure_ascii=False)}\n```"
-                                                    except Exception:
-                                                        formatted_result = str(
-                                                            tool_result
-                                                        )
+                                                    # Determine if this is a builtin tool (search_web, fetch_url, etc.)
+                                                    builtin_tool_names = {"search_web", "fetch_url", "web_search", "memory_query", "memory_add"}
+                                                    is_builtin_tool = tool_name in builtin_tool_names
 
-                                                    # Format tool input/parameters for display
-                                                    tool_input = tool_call_data.get(
-                                                        "input", {}
-                                                    )
-                                                    if tool_input:
+                                                    # Only emit tool results to UI if:
+                                                    # - It's a user-defined tool (always show), OR
+                                                    # - It's a builtin tool AND SHOW_BUILTIN_TOOL_RESULTS is True
+                                                    should_show_result = not is_builtin_tool or self.valves.SHOW_BUILTIN_TOOL_RESULTS
+
+                                                    if should_show_result:
+                                                        # Format and emit result to UI immediately
                                                         try:
-                                                            formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
+                                                            parsed_json = json.loads(
+                                                                tool_result
+                                                            )
+                                                            formatted_result = f"```json\n{json.dumps(parsed_json, indent=2, ensure_ascii=False)}\n```"
                                                         except Exception:
-                                                            formatted_input = f"```\n{str(tool_input)}\n```"
-                                                        input_section = f"**Input:**\n{formatted_input}\n\n"
-                                                    else:
-                                                        input_section = "**Input:** _(no parameters)_\n\n"
+                                                            formatted_result = str(
+                                                                tool_result
+                                                            )
 
-                                                    tool_result_msg = (
-                                                        f"\n\n<details>\n"
-                                                        f"<summary>🔧 Results for {tool_name}</summary>\n\n"
-                                                        f"{input_section}"
-                                                        f"**Output:**\n{formatted_result}\n"
-                                                        f"</details>\n"
-                                                    )
-                                                    await self.emit_message_delta(
-                                                        tool_result_msg,
-                                                        final_message,
-                                                        __event_emitter__,
-                                                    )
+                                                        # Format tool input/parameters for display
+                                                        tool_input = tool_call_data.get(
+                                                            "input", {}
+                                                        )
+                                                        if tool_input:
+                                                            try:
+                                                                formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
+                                                            except Exception:
+                                                                formatted_input = f"```\n{str(tool_input)}\n```"
+                                                            input_section = f"**Input:**\n{formatted_input}\n\n"
+                                                        else:
+                                                            input_section = "**Input:** _(no parameters)_\n\n"
+
+                                                        tool_result_msg = (
+                                                            f"\n\n<details>\n"
+                                                            f"<summary>🔧 Results for {tool_name}</summary>\n\n"
+                                                            f"{input_section}"
+                                                            f"**Output:**\n{formatted_result}\n"
+                                                            f"</details>\n"
+                                                        )
+                                                        await self.emit_message_delta(
+                                                            tool_result_msg,
+                                                            final_message,
+                                                            __event_emitter__,
+                                                        )
+                                                    else:
+                                                        # Builtin tool result - silently fed to model, just log it
+                                                        logger.debug(f"Builtin tool '{tool_name}' result fed to model silently (SHOW_BUILTIN_TOOL_RESULTS=False)")
                                             except Exception as ex:
                                                 logger.error(
                                                     f"❌ Tool execution failed: %s", ex
@@ -2816,15 +2902,96 @@ class Pipe:
                                 {
                                     "type": "status",
                                     "data": {
-                                        "description": f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Stopping tool execution.",
-                                        "done": True,
+                                        "description": f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Requesting final summary...",
+                                        "done": False,
                                     },
                                 }
                             )
-                            await self.emit_message_delta(
-                                f"\n\n⚠️ **SYSTEM MESSAGE**: Maximum tool call limit ({max_function_calls}) reached. Some tool results may not have been processed.",
-                                final_message,
-                                __event_emitter__,
+
+                            # Build assistant message with current tool_use blocks
+                            assistant_content = []
+                            if thinking_blocks:
+                                assistant_content.extend(thinking_blocks)
+                            final_message_snapshot = final_text()
+                            if final_message_snapshot.strip():
+                                assistant_content.append({"type": "text", "text": final_message_snapshot})
+                            for tool_use_block in tool_use_blocks:
+                                tool_id = tool_use_block.get("id", "")
+                                tool_name = tool_use_block.get("name", "")
+                                if not (tool_id.startswith("srvtoolu_") or tool_name in ["web_search", "code_execution"]):
+                                    assistant_content.append(tool_use_block)
+
+                            if assistant_content:
+                                payload_for_stream["messages"].append(
+                                    {"role": "assistant", "content": assistant_content}
+                                )
+
+                            # Add tool results
+                            user_content = tool_calls.copy()
+                            if user_content:
+                                payload_for_stream["messages"].append(
+                                    {"role": "user", "content": user_content}
+                                )
+
+                            # Add final prompt requesting summary (no tools allowed)
+                            payload_for_stream["messages"].append(
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "⚠️ SYSTEM: Tool call limit reached. You MUST now provide your final comprehensive response based on all the information gathered. Do NOT attempt any more tool calls - summarize your findings and provide your complete answer to the user's original request.",
+                                        }
+                                    ],
+                                }
+                            )
+
+                            # Remove tools from payload to force text-only response
+                            final_payload = {k: v for k, v in payload_for_stream.items() if k != "tools" and k != "tool_choice"}
+
+                            logger.info("[AZURE] Tool limit reached - making final API call for summary (no tools)")
+
+                            # Make final API call without tools
+                            try:
+                                async with client.messages.stream(**final_payload) as final_stream:
+                                    async for event in final_stream:
+                                        event_type = getattr(event, "type", None)
+                                        if event_type == "content_block_delta":
+                                            delta = getattr(event, "delta", None)
+                                            if delta:
+                                                delta_type = getattr(delta, "type", None)
+                                                if delta_type == "text_delta":
+                                                    text = getattr(delta, "text", "")
+                                                    if text:
+                                                        chunk += text
+                                                        chunk_count += 1
+                                                        if chunk_count >= token_buffer_size:
+                                                            await self.emit_message_delta(
+                                                                chunk, final_message, __event_emitter__
+                                                            )
+                                                            chunk = ""
+                                                            chunk_count = 0
+
+                                # Flush remaining chunk
+                                if chunk:
+                                    await self.emit_message_delta(chunk, final_message, __event_emitter__)
+
+                            except Exception as e:
+                                logger.error(f"Error in final summary call: {e}")
+                                await self.emit_message_delta(
+                                    f"\n\n⚠️ **Error generating final summary**: {str(e)}",
+                                    final_message,
+                                    __event_emitter__,
+                                )
+
+                            await emit_event_local(
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": f"✓ Complete (tool limit: {max_function_calls})",
+                                        "done": True,
+                                    },
+                                }
                             )
                             break
 
@@ -3159,6 +3326,8 @@ class Pipe:
         try:
             # Extract model and messages from body
             actual_model_name = body["model"].split("/")[-1]
+            # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+            actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
             messages = body.get("messages", [])
 
             # Build simple payload for task request (non-streaming)
@@ -3182,7 +3351,7 @@ class Pipe:
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            client = AsyncAnthropic(api_key=api_key, base_url=self.valves.ANTHROPIC_API_BASE)
 
             response = await client.messages.create(**task_payload)
 
