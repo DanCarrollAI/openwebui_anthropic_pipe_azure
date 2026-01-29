@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.12-azure.3
+version: 0.5.12-azure.4
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -41,6 +41,13 @@ Azure Modifications by DanCarrollAI:
 - Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 
 Changelog:
+v0.5.12-azure.4
+- Fixed: Final summary now properly handles extended thinking
+  - Previously disabled thinking entirely as a workaround (v0.5.12-azure.3)
+  - Now properly streams thinking_delta and wraps in collapsible section
+  - Model can reason through tool results before providing final response
+  - Maintains response quality for complex multi-tool queries
+
 v0.5.12-azure.3
 - Fixed: Tool limit final summary now disables thinking to ensure text output
   - Previously, if thinking was enabled, the final summary could output thinking blocks
@@ -2952,22 +2959,54 @@ class Pipe:
                                 }
                             )
 
-                            # Remove tools AND thinking from payload to force simple text-only response
-                            # This ensures the model outputs text directly without thinking blocks
-                            final_payload = {k: v for k, v in payload_for_stream.items() if k not in ["tools", "tool_choice", "thinking"]}
+                            # Remove tools from payload but keep thinking enabled
+                            # Model can reason through tool results before providing final response
+                            final_payload = {k: v for k, v in payload_for_stream.items() if k not in ["tools", "tool_choice"]}
 
                             logger.info("[AZURE] Tool limit reached - making final API call for summary (no tools)")
 
                             # Make final API call without tools
+                            # State for tracking thinking in final summary
+                            final_summary_thinking = ""
+                            final_thinking_start_pos = len(final_text())
+                            final_is_thinking = False
+
                             try:
                                 async with client.messages.stream(**final_payload) as final_stream:
                                     async for event in final_stream:
                                         event_type = getattr(event, "type", None)
-                                        if event_type == "content_block_delta":
+
+                                        # Handle content_block_start - detect thinking blocks
+                                        if event_type == "content_block_start":
+                                            content_block = getattr(event, "content_block", None)
+                                            if content_block:
+                                                block_type = getattr(content_block, "type", None)
+                                                if block_type == "thinking":
+                                                    final_is_thinking = True
+                                                    final_thinking_start_pos = len(final_text())
+                                                    final_summary_thinking = ""
+                                                    # Emit "Thinking..." status
+                                                    await emit_event_local({
+                                                        "type": "status",
+                                                        "data": {"description": "Thinking...", "done": False}
+                                                    })
+
+                                        # Handle content_block_delta - thinking and text
+                                        elif event_type == "content_block_delta":
                                             delta = getattr(event, "delta", None)
                                             if delta:
                                                 delta_type = getattr(delta, "type", None)
-                                                if delta_type == "text_delta":
+
+                                                if delta_type == "thinking_delta":
+                                                    thinking_text = getattr(delta, "thinking", "")
+                                                    if thinking_text:
+                                                        final_summary_thinking += thinking_text
+                                                        # Stream raw thinking text (will be wrapped on block completion)
+                                                        await self.emit_message_delta(
+                                                            thinking_text, final_message, __event_emitter__
+                                                        )
+
+                                                elif delta_type == "text_delta":
                                                     text = getattr(delta, "text", "")
                                                     if text:
                                                         chunk += text
@@ -2978,6 +3017,33 @@ class Pipe:
                                                             )
                                                             chunk = ""
                                                             chunk_count = 0
+
+                                        # Handle content_block_stop - wrap thinking in collapsible
+                                        elif event_type == "content_block_stop":
+                                            if final_is_thinking and final_summary_thinking:
+                                                # Wrap thinking in details/summary via message:replace
+                                                current_content = final_text()
+                                                before_thinking = current_content[:final_thinking_start_pos]
+                                                thinking_content = current_content[final_thinking_start_pos:]
+
+                                                wrapped_thinking = (
+                                                    "\n<details>\n<summary>🧠 Thoughts</summary>\n\n"
+                                                    + thinking_content
+                                                    + "\n</details>\n"
+                                                )
+
+                                                new_content = before_thinking + wrapped_thinking
+                                                final_message.clear()
+                                                final_message.append(new_content)
+
+                                                # Emit replace event to update UI
+                                                await emit_event_local({
+                                                    "type": "replace",
+                                                    "data": {"content": new_content}
+                                                })
+
+                                                final_is_thinking = False
+                                                final_summary_thinking = ""
 
                                 # Flush remaining chunk
                                 if chunk:
