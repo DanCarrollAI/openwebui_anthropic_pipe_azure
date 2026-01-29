@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.12-azure.6
+version: 0.5.12-azure.7
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -41,6 +41,14 @@ Azure Modifications by DanCarrollAI:
 - Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 
 Changelog:
+v0.5.12-azure.7
+- Improved: Thinking now displays in status bar with animation instead of flashing in output
+  - Thinking content streams to status bar with "done: False" for animation
+  - No more "flash" of raw thinking text appearing then being wrapped
+  - Added SHOW_THINKING_IN_CHAT valve (default: False) to optionally persist thinking as collapsible
+  - When False (default): cleaner UX, thinking only visible during streaming
+  - When True: thinking added to chat as collapsible <details> section after completion
+
 v0.5.12-azure.6
 - Fixed: Final summary error "unexpected keyword argument 'output_config'"
   - output_config (beta effort param) was being passed to final summary API call
@@ -283,9 +291,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Pattern to match thinking blocks in message content (for removal from history)
-# Matches: <details><summary>🧠 Thinking...</summary>\n...\n</details>
+# Matches: <details><summary>Thinking...</summary>\n...\n</details>
 PATTERN_THINKING_BLOCK = re.compile(
-    r"<details>\s*<summary>🧠.*?</summary>.*?</details>\s*",
+    r"<details>\s*<summary>Thoughts.*?</summary>.*?</details>\s*",
     flags=re.DOTALL
 )
 
@@ -554,6 +562,10 @@ class Pipe:
         SHOW_BUILTIN_TOOL_RESULTS: bool = Field(
             default=False,
             description="Show builtin tool results (search_web, fetch_url) as expandable JSON in chat. When False, results are fed to model silently for cleaner chat experience.",
+        )
+        SHOW_THINKING_IN_CHAT: bool = Field(
+            default=False,
+            description="Show thinking/reasoning in chat as collapsible section. When False (default), thinking shows only in status bar with animation for cleaner UX.",
         )
         MAX_TOOL_CALLS: int = Field(
             default=15,
@@ -1284,7 +1296,7 @@ class Pipe:
                             "type": "notification",
                             "data": {
                                 "type": "info",
-                                "content": "🧠 Thinking mode is active - Web search was added but not enforced. Claude can use it if needed.",
+                                "content": "Thinking mode is active - Web search was added but not enforced. Claude can use it if needed.",
                             },
                         },
                         __event_emitter__,
@@ -2337,12 +2349,21 @@ class Pipe:
                                             current_thinking_block[
                                                 "thinking"
                                             ] += thinking_text
-                                        # Stream raw thinking text (will be wrapped on block completion)
-                                        await self.emit_message_delta(
-                                            thinking_text,
-                                            final_message,
-                                            __event_emitter__,
-                                        )
+
+                                        # Show thinking in status bar with animation (not in chat output)
+                                        # Truncate to last ~200 chars for status bar display
+                                        full_thinking = current_thinking_block.get("thinking", "")
+                                        display_text = full_thinking[-200:] if len(full_thinking) > 200 else full_thinking
+                                        # Clean up for single-line status display
+                                        display_text = display_text.replace("\n", " ").strip()
+                                        if display_text:
+                                            await emit_event_local({
+                                                "type": "status",
+                                                "data": {
+                                                    "description": f"Thinking: {display_text}...",
+                                                    "done": False,
+                                                }
+                                            })
                                     elif delta_type == "signature_delta":
                                         # Capture signature for thinking block preservation
                                         signature = getattr(delta, "signature", "")
@@ -2628,46 +2649,40 @@ class Pipe:
 
                                 if is_model_thinking:
                                     # Preserve thinking block for multi-turn (API auto-filters)
+                                    thinking_content = ""
                                     if (
                                         current_thinking_block
                                         and current_thinking_block.get("thinking")
                                     ):
+                                        thinking_content = current_thinking_block.get("thinking", "")
                                         thinking_blocks.append(current_thinking_block)
                                         logger.debug(
-                                            f"Preserved thinking block with {len(current_thinking_block.get('thinking', ''))} chars"
+                                            f"Preserved thinking block with {len(thinking_content)} chars"
                                         )
-                                    
-                                    # Thinking block complete - wrap with details/summary via message:replace
-                                    current_content = final_text()
-                                    
-                                    # Extract the thinking block content using tracked start position
-                                    before_thinking = current_content[:thinking_block_start_pos]
-                                    thinking_content = current_content[thinking_block_start_pos:]
-                                    
-                                    # Build wrapped version
-                                    wrapped_thinking = (
-                                        "\n<details>\n<summary>🧠 Thoughts</summary>\n\n"
-                                        + thinking_content
-                                        + "\n</details>\n"
-                                    )
-                                    
-                                    # Replace entire message with wrapped version
-                                    new_content = before_thinking + wrapped_thinking
-                                    
-                                    # Update final_message tracking
-                                    final_message.clear()
-                                    final_message.append(new_content)
-                                    
-                                    # Emit replace event to update UI
-                                    await emit_event_local(
-                                        {
-                                            "type": "replace",
-                                            "data": {
-                                                "content": new_content
-                                            },
+
+                                    # Only add thinking to chat output if valve is enabled
+                                    if self.valves.SHOW_THINKING_IN_CHAT and thinking_content:
+                                        # Build wrapped collapsible section
+                                        wrapped_thinking = (
+                                            "\n<details>\n<summary>Thoughts</summary>\n\n"
+                                            + thinking_content
+                                            + "\n</details>\n"
+                                        )
+
+                                        # Add to output
+                                        await self.emit_message_delta(
+                                            wrapped_thinking, final_message, __event_emitter__
+                                        )
+
+                                    # Clear thinking status (animation stops)
+                                    await emit_event_local({
+                                        "type": "status",
+                                        "data": {
+                                            "description": "Responding...",
+                                            "done": False,
                                         }
-                                    )
-                                    
+                                    })
+
                                     is_model_thinking = False
                                     current_thinking_block = {}
 
@@ -2983,7 +2998,6 @@ class Pipe:
                             # Make final API call without tools
                             # State for tracking thinking in final summary
                             final_summary_thinking = ""
-                            final_thinking_start_pos = len(final_text())
                             final_is_thinking = False
 
                             try:
@@ -2998,7 +3012,6 @@ class Pipe:
                                                 block_type = getattr(content_block, "type", None)
                                                 if block_type == "thinking":
                                                     final_is_thinking = True
-                                                    final_thinking_start_pos = len(final_text())
                                                     final_summary_thinking = ""
                                                     # Emit "Thinking..." status
                                                     await emit_event_local({
@@ -3016,10 +3029,17 @@ class Pipe:
                                                     thinking_text = getattr(delta, "thinking", "")
                                                     if thinking_text:
                                                         final_summary_thinking += thinking_text
-                                                        # Stream raw thinking text (will be wrapped on block completion)
-                                                        await self.emit_message_delta(
-                                                            thinking_text, final_message, __event_emitter__
-                                                        )
+                                                        # Show in status bar with animation (not in chat output)
+                                                        display_text = final_summary_thinking[-200:] if len(final_summary_thinking) > 200 else final_summary_thinking
+                                                        display_text = display_text.replace("\n", " ").strip()
+                                                        if display_text:
+                                                            await emit_event_local({
+                                                                "type": "status",
+                                                                "data": {
+                                                                    "description": f"Thinking: {display_text}...",
+                                                                    "done": False,
+                                                                }
+                                                            })
 
                                                 elif delta_type == "text_delta":
                                                     text = getattr(delta, "text", "")
@@ -3033,28 +3053,27 @@ class Pipe:
                                                             chunk = ""
                                                             chunk_count = 0
 
-                                        # Handle content_block_stop - wrap thinking in collapsible
+                                        # Handle content_block_stop - optionally add thinking to chat
                                         elif event_type == "content_block_stop":
                                             if final_is_thinking and final_summary_thinking:
-                                                # Wrap thinking in details/summary via message:replace
-                                                current_content = final_text()
-                                                before_thinking = current_content[:final_thinking_start_pos]
-                                                thinking_content = current_content[final_thinking_start_pos:]
+                                                # Only add thinking to chat output if valve is enabled
+                                                if self.valves.SHOW_THINKING_IN_CHAT:
+                                                    wrapped_thinking = (
+                                                        "\n<details>\n<summary>Thoughts</summary>\n\n"
+                                                        + final_summary_thinking
+                                                        + "\n</details>\n"
+                                                    )
+                                                    await self.emit_message_delta(
+                                                        wrapped_thinking, final_message, __event_emitter__
+                                                    )
 
-                                                wrapped_thinking = (
-                                                    "\n<details>\n<summary>🧠 Thoughts</summary>\n\n"
-                                                    + thinking_content
-                                                    + "\n</details>\n"
-                                                )
-
-                                                new_content = before_thinking + wrapped_thinking
-                                                final_message.clear()
-                                                final_message.append(new_content)
-
-                                                # Emit replace event to update UI
+                                                # Clear thinking status
                                                 await emit_event_local({
-                                                    "type": "replace",
-                                                    "data": {"content": new_content}
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": "Responding...",
+                                                        "done": False,
+                                                    }
                                                 })
 
                                                 final_is_thinking = False
@@ -3614,7 +3633,7 @@ class Pipe:
         re-sent to the API in subsequent requests.
 
         Removes HTML details blocks containing thinking content, e.g.:
-        <details><summary>🧠 Thinking...</summary>\n...\n</details>
+        <details><summary>Thinking...</summary>\n...\n</details>
 
         Note: Does not strip whitespace - stripping is handled elsewhere as needed.
         Uses pre-compiled PATTERN_THINKING_BLOCK for performance.
