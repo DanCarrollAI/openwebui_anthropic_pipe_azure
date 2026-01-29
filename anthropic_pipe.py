@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.12-azure.5
+version: 0.5.12-azure.6
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -41,6 +41,11 @@ Azure Modifications by DanCarrollAI:
 - Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 
 Changelog:
+v0.5.12-azure.6
+- Fixed: Final summary error "unexpected keyword argument 'output_config'"
+  - output_config (beta effort param) was being passed to final summary API call
+  - Now excluded from final_payload alongside tools and tool_choice
+
 v0.5.12-azure.5
 - Fixed: Critical bug causing missing responses after tool execution
   - Tool call counter was double-incremented (once before limit check, once after)
@@ -2968,9 +2973,10 @@ class Pipe:
                                 }
                             )
 
-                            # Remove tools from payload but keep thinking enabled
+                            # Remove tools and beta-only params from payload but keep thinking enabled
                             # Model can reason through tool results before providing final response
-                            final_payload = {k: v for k, v in payload_for_stream.items() if k not in ["tools", "tool_choice"]}
+                            # Note: output_config is a beta param that can't be passed directly to stream()
+                            final_payload = {k: v for k, v in payload_for_stream.items() if k not in ["tools", "tool_choice", "output_config"]}
 
                             logger.info("[AZURE] Tool limit reached - making final API call for summary (no tools)")
 
