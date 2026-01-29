@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.12-azure.7
+version: 0.5.12-azure.10
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -41,13 +41,22 @@ Azure Modifications by DanCarrollAI:
 - Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 
 Changelog:
-v0.5.12-azure.7
-- Improved: Thinking now displays in status bar with animation instead of flashing in output
-  - Thinking content streams to status bar with "done: False" for animation
-  - No more "flash" of raw thinking text appearing then being wrapped
-  - Added SHOW_THINKING_IN_CHAT valve (default: False) to optionally persist thinking as collapsible
-  - When False (default): cleaner UX, thinking only visible during streaming
-  - When True: thinking added to chat as collapsible <details> section after completion
+v0.5.12-azure.9
+- Improved: Cleaner tool status - removed generic "Executing tool:" for search/fetch
+  - search_web/web_search now shows only "Searching: {query}" (no prefix)
+  - fetch_url now shows only "Fetching: {url}" (no prefix)
+  - Other tools still show "Executing: {tool_name}" for visibility
+  - More polished UX - users see what's happening, not dev details
+
+v0.5.12-azure.8
+- Improved: Cleaner thinking display with THINKING_DISPLAY valve
+  - "collapsible" (default): Shows "Thinking..." status, adds collapsible to chat when done
+  - "status_only": Just shows "Thinking..." status, nothing persisted
+  - No rapid status spam - just clean "Thinking..." during, then collapsible after
+- Improved: Better tool status messages for search/fetch
+  - search_web/web_search now shows "Searching: {query}"
+  - fetch_url now shows "Fetching: {url}"
+  - Rapid-fire tool status updates for responsive UX
 
 v0.5.12-azure.6
 - Fixed: Final summary error "unexpected keyword argument 'output_config'"
@@ -563,9 +572,9 @@ class Pipe:
             default=False,
             description="Show builtin tool results (search_web, fetch_url) as expandable JSON in chat. When False, results are fed to model silently for cleaner chat experience.",
         )
-        SHOW_THINKING_IN_CHAT: bool = Field(
+        SHOW_TOOL_LIMIT_WARNINGS: bool = Field(
             default=False,
-            description="Show thinking/reasoning in chat as collapsible section. When False (default), thinking shows only in status bar with animation for cleaner UX.",
+            description="Show tool limit warnings in status bar. When False (default), tool limits are handled silently for cleaner UX.",
         )
         MAX_TOOL_CALLS: int = Field(
             default=15,
@@ -2087,18 +2096,19 @@ class Pipe:
                                         f"🔧 Tool use block started: {tool_name}"
                                     )
 
-                                    # Emit status immediately when tool_use block starts (before input generation)
-                                    await emit_event_local(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "description": f"🔧 Executing tool: {tool_name}",
-                                                "done": False,
-                                            },
-                                        }
-                                    )
-                                    # Give UI time to update
-                                    await asyncio.sleep(0.05)
+                                    # For search/fetch tools, skip generic status - we'll show query/URL later
+                                    # For other tools, show generic status since we don't have special handling
+                                    if tool_name not in ("search_web", "web_search", "fetch_url"):
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": f"Executing: {tool_name}",
+                                                    "done": False,
+                                                },
+                                            }
+                                        )
+                                        await asyncio.sleep(0.05)
 
                                     tools_buffer = (
                                         "{"
@@ -2349,21 +2359,8 @@ class Pipe:
                                             current_thinking_block[
                                                 "thinking"
                                             ] += thinking_text
-
-                                        # Show thinking in status bar with animation (not in chat output)
-                                        # Truncate to last ~200 chars for status bar display
-                                        full_thinking = current_thinking_block.get("thinking", "")
-                                        display_text = full_thinking[-200:] if len(full_thinking) > 200 else full_thinking
-                                        # Clean up for single-line status display
-                                        display_text = display_text.replace("\n", " ").strip()
-                                        if display_text:
-                                            await emit_event_local({
-                                                "type": "status",
-                                                "data": {
-                                                    "description": f"Thinking: {display_text}...",
-                                                    "done": False,
-                                                }
-                                            })
+                                        # Just accumulate - "Thinking..." status already shown at block start
+                                        # Collapsible will be added at content_block_stop if enabled
                                     elif delta_type == "signature_delta":
                                         # Capture signature for thinking block preservation
                                         signature = getattr(delta, "signature", "")
@@ -2582,13 +2579,37 @@ class Pipe:
                                             }
                                         )
 
+                                        # Update status with more descriptive message for search/fetch tools
+                                        if tool_name in ("search_web", "web_search"):
+                                            query = tool_input.get("query", tool_input.get("q", ""))
+                                            if query:
+                                                await emit_event_local({
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"Searching: {query[:80]}{'...' if len(query) > 80 else ''}",
+                                                        "done": False,
+                                                    }
+                                                })
+                                        elif tool_name == "fetch_url":
+                                            url = tool_input.get("url", "")
+                                            if url:
+                                                # Truncate URL for display
+                                                display_url = url[:60] + "..." if len(url) > 60 else url
+                                                await emit_event_local({
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"Fetching: {display_url}",
+                                                        "done": False,
+                                                    }
+                                                })
+
                                         # Look up tool in __tools__ first (user tools with callable)
                                         tool = __tools__.get(tool_name) if __tools__ else None
                                         if tool and tool.get("callable"):
                                             # User tool with callable - execute directly
                                             tool_call_data_list.append(tool_call_data)
 
-                                            # Start execution immediately as async task (no extra status event needed)
+                                            # Start execution immediately as async task
                                             args = (
                                                 tool_input
                                                 if isinstance(tool_input, dict)
@@ -2660,8 +2681,8 @@ class Pipe:
                                             f"Preserved thinking block with {len(thinking_content)} chars"
                                         )
 
-                                    # Only add thinking to chat output if valve is enabled
-                                    if self.valves.SHOW_THINKING_IN_CHAT and thinking_content:
+                                    # Add thinking to chat as collapsible section
+                                    if thinking_content:
                                         # Build wrapped collapsible section
                                         wrapped_thinking = (
                                             "\n<details>\n<summary>Thoughts</summary>\n\n"
@@ -3029,17 +3050,7 @@ class Pipe:
                                                     thinking_text = getattr(delta, "thinking", "")
                                                     if thinking_text:
                                                         final_summary_thinking += thinking_text
-                                                        # Show in status bar with animation (not in chat output)
-                                                        display_text = final_summary_thinking[-200:] if len(final_summary_thinking) > 200 else final_summary_thinking
-                                                        display_text = display_text.replace("\n", " ").strip()
-                                                        if display_text:
-                                                            await emit_event_local({
-                                                                "type": "status",
-                                                                "data": {
-                                                                    "description": f"Thinking: {display_text}...",
-                                                                    "done": False,
-                                                                }
-                                                            })
+                                                        # Just accumulate - "Thinking..." status already shown
 
                                                 elif delta_type == "text_delta":
                                                     text = getattr(delta, "text", "")
@@ -3053,19 +3064,17 @@ class Pipe:
                                                             chunk = ""
                                                             chunk_count = 0
 
-                                        # Handle content_block_stop - optionally add thinking to chat
+                                        # Handle content_block_stop - add thinking to chat as collapsible
                                         elif event_type == "content_block_stop":
                                             if final_is_thinking and final_summary_thinking:
-                                                # Only add thinking to chat output if valve is enabled
-                                                if self.valves.SHOW_THINKING_IN_CHAT:
-                                                    wrapped_thinking = (
-                                                        "\n<details>\n<summary>Thoughts</summary>\n\n"
-                                                        + final_summary_thinking
-                                                        + "\n</details>\n"
-                                                    )
-                                                    await self.emit_message_delta(
-                                                        wrapped_thinking, final_message, __event_emitter__
-                                                    )
+                                                wrapped_thinking = (
+                                                    "\n<details>\n<summary>Thoughts</summary>\n\n"
+                                                    + final_summary_thinking
+                                                    + "\n</details>\n"
+                                                )
+                                                await self.emit_message_delta(
+                                                    wrapped_thinking, final_message, __event_emitter__
+                                                )
 
                                                 # Clear thinking status
                                                 await emit_event_local({
@@ -3202,7 +3211,7 @@ class Pipe:
                                 {
                                     "type": "status",
                                     "data": {
-                                        "description": f"⚠️ Final tool call available - after next tool use, conversation will be terminated",
+                                        "description": "Finishing up with one more action...",
                                         "done": False,
                                     },
                                 }
@@ -3221,13 +3230,13 @@ class Pipe:
                                     ],
                                 }
                             )
-                        elif remaining <= 3:
-                            # Approaching limit - inform user
+                        elif remaining <= 3 and self.valves.SHOW_TOOL_LIMIT_WARNINGS:
+                            # Approaching limit - inform user (only if valve enabled)
                             await emit_event_local(
                                 {
                                     "type": "status",
                                     "data": {
-                                        "description": f"⚠️ Only {remaining} tool call(s) remaining before limit",
+                                        "description": f"Wrapping up... ({remaining} actions remaining)",
                                         "done": False,
                                     },
                                 }
@@ -3373,7 +3382,7 @@ class Pipe:
         # - Emit chat:completion event with usage stats
         # - Return final message text
         # ---------------------------------------------------------
-        final_status = "✅ Response processing complete."
+        final_status = "Response complete."
         show_token_count = __user__["valves"].SHOW_TOKEN_COUNT
         if show_token_count and total_usage:
             # Use total_tokens from total_usage which now represents the last turn (Context Size)
