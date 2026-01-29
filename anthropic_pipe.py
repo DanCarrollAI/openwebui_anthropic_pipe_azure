@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.12-azure.2
+version: 0.5.12-azure.3
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -41,6 +41,12 @@ Azure Modifications by DanCarrollAI:
 - Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 
 Changelog:
+v0.5.12-azure.3
+- Fixed: Tool limit final summary now disables thinking to ensure text output
+  - Previously, if thinking was enabled, the final summary could output thinking blocks
+    which were ignored, resulting in no visible response
+  - Final summary payload now excludes "thinking" setting alongside "tools"
+
 v0.5.12-azure.2
 - Added: Builtin tools (search_web, fetch_url) now respect the OpenWebUI web search toggle
   - When toggle is OFF, these tools are filtered from the builtin tools registry
@@ -2946,8 +2952,9 @@ class Pipe:
                                 }
                             )
 
-                            # Remove tools from payload to force text-only response
-                            final_payload = {k: v for k, v in payload_for_stream.items() if k != "tools" and k != "tool_choice"}
+                            # Remove tools AND thinking from payload to force simple text-only response
+                            # This ensures the model outputs text directly without thinking blocks
+                            final_payload = {k: v for k, v in payload_for_stream.items() if k not in ["tools", "tool_choice", "thinking"]}
 
                             logger.info("[AZURE] Tool limit reached - making final API call for summary (no tools)")
 
