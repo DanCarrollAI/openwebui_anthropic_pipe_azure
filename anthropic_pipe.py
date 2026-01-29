@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.12-azure.4
+version: 0.5.12-azure.5
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -41,6 +41,14 @@ Azure Modifications by DanCarrollAI:
 - Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 
 Changelog:
+v0.5.12-azure.5
+- Fixed: Critical bug causing missing responses after tool execution
+  - Tool call counter was double-incremented (once before limit check, once after)
+  - With MAX_TOOL_CALLS=3 and 2 tools called, counter jumped to 3 immediately
+  - Loop exited before model could respond with tool results
+  - Now correctly checks `current + pending >= limit` before processing
+  - Bug existed in upstream code - not introduced by Azure fork
+
 v0.5.12-azure.4
 - Fixed: Final summary now properly handles extended thinking
   - Previously disabled thinking entirely as a workaround (v0.5.12-azure.3)
@@ -2909,8 +2917,9 @@ class Pipe:
                     # ---------------------------------------------------------
                     if has_pending_tool_calls and tool_calls:
                         # Check if we've reached the max tool call limit
-                        current_function_calls += 1
-                        if current_function_calls >= max_function_calls:
+                        # Note: current_function_calls is updated at end of normal processing (line ~3158)
+                        # We check here BEFORE processing to trigger final summary if at limit
+                        if current_function_calls + len(tool_calls) >= max_function_calls:
                             await emit_event_local(
                                 {
                                     "type": "status",
