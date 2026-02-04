@@ -1,10 +1,9 @@
 """
-title: Anthropic API Integration
-id: anthropic_new
-author: Podden (https://github.com/Podden/)
-github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
+title: Anthropic API Integration (Azure Compatible)
+author: DanCarrollAI (https://github.com/DanCarrollAI)
+based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.1
+version: 0.6.1-azure.10
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -31,13 +30,27 @@ Supports:
 - Tool Search (BM25/Regex)
 - Native PDF Upload (visual PDF analysis with charts/images)
 - Agent Skills (pptx, xlsx, docx, pdf and custom skills)
+- Azure Anthropic API compatibility (date suffix stripping for model names)
+
+Azure Modifications by DanCarrollAI:
+- Added Azure Anthropic API compatibility
+- Model name date suffix stripping for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+- Added ANTHROPIC_API_BASE valve for custom endpoints (Azure, proxies)
+- Added ENABLED_MODELS valve to specify only deployed models (prevents auto-population of all models)
+- Changed default UserValves: ENABLE_THINKING=True, THINKING_BUDGET_TOKENS=20000, WEB_SEARCH_MAX_USES=8
+- Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
+- Added SHOW_TOOL_LIMIT_WARNINGS valve for cleaner UX
 
 Changelog:
-v0.6.2
+v0.6.1-azure.10
+- Rebased Azure changes onto Podden's upstream beta (v0.6.1)
+- Includes Files API, Skills, Code Execution from upstream
+- All Azure compatibility features preserved
+
+v0.6.2 (upstream)
 - Reordered Payload for better Caching
 
-
-v0.6.1
+v0.6.1 (upstream)
 - Full Skills Support: Users can add skills (eg. pptx, xlsx, docx, pdf) or custom skills already uploaded to the Anthropic Site
 - Skills are validated against the List Skills API endpoint with caching to avoid redundant API calls
 - Invalid skills are logged and users are notified via warning message
@@ -253,9 +266,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Pattern to match thinking blocks in message content (for removal from history)
-# Matches: <details><summary>🧠 Thinking...</summary>\n...\n</details>
+# Matches: <details><summary>Thoughts...</summary>\n...\n</details>
 PATTERN_THINKING_BLOCK = re.compile(
-    r"<details>\s*<summary>🧠.*?</summary>.*?</details>\s*",
+    r"<details>\s*<summary>Thoughts.*?</summary>.*?</details>\s*",
     flags=re.DOTALL
 )
 
@@ -508,6 +521,14 @@ class Pipe:
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
+        ANTHROPIC_API_BASE: str = Field(
+            default="https://api.anthropic.com",
+            description="Base URL for Anthropic API. For Azure: https://<resource>.cognitiveservices.azure.com/anthropic",
+        )
+        ENABLED_MODELS: str = Field(
+            default="",
+            description="Comma-separated list of model names to enable (e.g., 'claude-sonnet-4,claude-opus-4'). Leave empty to auto-fetch from API or use all static models.",
+        )
         # ENABLE_CLAUDE_MEMORY: bool = Field(
         #     default=False,
         #     description="Enable Claude memory tool",
@@ -519,6 +540,14 @@ class Pipe:
         WEB_SEARCH: bool = Field(
             default=True,
             description="Enable web search tool for Claude models. Use Anthropic Web Search Toggle Function for fine grained control",
+        )
+        SHOW_BUILTIN_TOOL_RESULTS: bool = Field(
+            default=False,
+            description="Show builtin tool results (search_web, fetch_url) as expandable JSON in chat. When False, results are fed to model silently for cleaner chat experience.",
+        )
+        SHOW_TOOL_LIMIT_WARNINGS: bool = Field(
+            default=False,
+            description="Show tool limit warnings in status bar. When False (default), tool limits are handled silently for cleaner UX.",
         )
         MAX_TOOL_CALLS: int = Field(
             default=15,
@@ -621,12 +650,12 @@ class Pipe:
 
     class UserValves(BaseModel):
         ENABLE_THINKING: bool = Field(
-            default=False,
+            default=True,
             description="Enable Extended Thinking",
         )
         THINKING_BUDGET_TOKENS: int = Field(
-            default=8192,
-            ge=1024,
+            default=20000,
+            ge=0,
             le=64000,
             description="Thinking budget tokens",
         )
@@ -635,7 +664,7 @@ class Pipe:
             description="Effort level for this user. Also Controllable with OpenWebUI's reasoning_effort parameter.",
         )
         USE_PDF_NATIVE_UPLOAD: bool = Field(
-            default=True,
+            default=False,
             description="Upload PDFs as native base64 documents instead of RAG text extraction. Enables visual PDF analysis (charts, images, layouts). Only applies to 'Use Full Document' mode.",
         )
         SHOW_TOKEN_COUNT: bool = Field(
@@ -643,7 +672,7 @@ class Pipe:
             description="Show Context Window Progress",
         )
         WEB_SEARCH_MAX_USES: int = Field(
-            default=5,
+            default=8,
             ge=1,
             le=20,
             description="Maximum number of web searches",
@@ -688,13 +717,36 @@ class Pipe:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
         Fallback to static list on error. Returns OpenWebUI model dicts.
+
+        If ENABLED_MODELS valve is set, only returns those specific models.
         """
         from anthropic import AsyncAnthropic
 
         models = []
+
+        # If ENABLED_MODELS is specified, only return those models
+        if self.valves.ENABLED_MODELS.strip():
+            enabled_list = [m.strip() for m in self.valves.ENABLED_MODELS.split(",") if m.strip()]
+            for name in enabled_list:
+                info = self.get_model_info(name)
+                models.append(
+                    {
+                        "id": f"anthropic/{name}",
+                        "name": name,
+                        "context_length": info["context_length"],
+                        "supports_vision": info["supports_vision"],
+                        "supports_thinking": info["supports_thinking"],
+                        "is_hybrid_model": info["supports_thinking"],
+                        "max_output_tokens": info["max_tokens"],
+                        "info": {"meta": {"capabilities": {"status_updates": True}}},
+                    }
+                )
+            return models
+
         try:
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url)
             async for m in client.models.list():
                 name = m.id
                 display_name = getattr(m, "display_name", name)
@@ -1238,6 +1290,8 @@ class Pipe:
         
         ## General payload creation
         actual_model_name = body["model"].split("/")[-1]
+        # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+        actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
         model_info = self.get_model_info(actual_model_name)
         max_tokens_limit = model_info["max_tokens"]
         requested_max_tokens = body.get("max_tokens", max_tokens_limit)
@@ -1948,7 +2002,8 @@ class Pipe:
                 await emit("__task__", __task_body__)
             return "test"
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url, default_headers=headers)
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
 
             # =========================================================================
@@ -3074,22 +3129,145 @@ class Pipe:
                     # ---------------------------------------------------------
                     if has_pending_tool_calls and tool_calls:
                         # Check if we've reached the max tool call limit
-                        current_function_calls += 1
-                        if current_function_calls >= max_function_calls:
-                            await emit_event_local(
+                        # Note: current_function_calls is updated at end of normal processing
+                        # We check here BEFORE processing to trigger final summary if at limit
+                        if current_function_calls + len(tool_calls) >= max_function_calls:
+                            if self.valves.SHOW_TOOL_LIMIT_WARNINGS:
+                                await emit_event_local(
+                                    {
+                                        "type": "status",
+                                        "data": {
+                                            "description": f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Requesting final summary...",
+                                            "done": False,
+                                        },
+                                    }
+                                )
+
+                            # Build assistant message with current tool_use blocks
+                            assistant_content = []
+                            if thinking_blocks:
+                                assistant_content.extend(thinking_blocks)
+                            final_message_snapshot = final_text()
+                            if final_message_snapshot.strip():
+                                assistant_content.append({"type": "text", "text": final_message_snapshot})
+                            for tool_use_block in tool_use_blocks:
+                                tool_id = tool_use_block.get("id", "")
+                                tool_name = tool_use_block.get("name", "")
+                                if not (tool_id.startswith("srvtoolu_") or tool_name in ["web_search", "code_execution"]):
+                                    assistant_content.append(tool_use_block)
+
+                            if assistant_content:
+                                payload_for_stream["messages"].append(
+                                    {"role": "assistant", "content": assistant_content}
+                                )
+
+                            # Add tool results
+                            user_content = tool_calls.copy()
+                            if user_content:
+                                payload_for_stream["messages"].append(
+                                    {"role": "user", "content": user_content}
+                                )
+
+                            # Add final prompt requesting summary (no tools allowed)
+                            payload_for_stream["messages"].append(
                                 {
-                                    "type": "status",
-                                    "data": {
-                                        "description": f"⚠️ Maximum tool call limit ({max_function_calls}) reached. Stopping tool execution.",
-                                        "done": True,
-                                    },
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "⚠️ SYSTEM: Tool call limit reached. You MUST now provide your final comprehensive response based on all the information gathered. Do NOT attempt any more tool calls - summarize your findings and provide your complete answer to the user's original request.",
+                                        }
+                                    ],
                                 }
                             )
-                            await self.emit_message_delta(
-                                f"\n\n⚠️ **SYSTEM MESSAGE**: Maximum tool call limit ({max_function_calls}) reached. Some tool results may not have been processed.",
-                                final_message,
-                                __event_emitter__,
-                            )
+
+                            # Remove tools and beta-only params from payload but keep thinking enabled
+                            # Note: output_config is a beta param that can't be passed directly to stream()
+                            final_payload = {k: v for k, v in payload_for_stream.items() if k not in ["tools", "tool_choice", "output_config"]}
+
+                            logger.info("[AZURE] Tool limit reached - making final API call for summary (no tools)")
+
+                            # Make final API call without tools
+                            final_summary_thinking = ""
+                            final_is_thinking = False
+
+                            try:
+                                async with client.beta.messages.stream(**final_payload) as final_stream:
+                                    async for event in final_stream:
+                                        event_type = getattr(event, "type", None)
+
+                                        if event_type == "content_block_start":
+                                            content_block = getattr(event, "content_block", None)
+                                            if content_block:
+                                                block_type = getattr(content_block, "type", None)
+                                                if block_type == "thinking":
+                                                    final_is_thinking = True
+                                                    final_summary_thinking = ""
+                                                    await emit_event_local({
+                                                        "type": "status",
+                                                        "data": {"description": "Thinking...", "done": False}
+                                                    })
+
+                                        elif event_type == "content_block_delta":
+                                            delta = getattr(event, "delta", None)
+                                            if delta:
+                                                delta_type = getattr(delta, "type", None)
+
+                                                if delta_type == "thinking_delta":
+                                                    thinking_text = getattr(delta, "thinking", "")
+                                                    if thinking_text:
+                                                        final_summary_thinking += thinking_text
+
+                                                elif delta_type == "text_delta":
+                                                    text = getattr(delta, "text", "")
+                                                    if text:
+                                                        chunk += text
+                                                        chunk_count += 1
+                                                        if chunk_count >= token_buffer_size:
+                                                            await self.emit_message_delta(
+                                                                chunk, final_message, __event_emitter__
+                                                            )
+                                                            chunk = ""
+                                                            chunk_count = 0
+
+                                        elif event_type == "content_block_stop":
+                                            if final_is_thinking and final_summary_thinking:
+                                                wrapped_thinking = (
+                                                    "\n<details>\n<summary>Thoughts</summary>\n\n"
+                                                    + final_summary_thinking
+                                                    + "\n</details>\n"
+                                                )
+                                                await self.emit_message_delta(
+                                                    wrapped_thinking, final_message, __event_emitter__
+                                                )
+                                                await emit_event_local({
+                                                    "type": "status",
+                                                    "data": {"description": "Responding...", "done": False}
+                                                })
+                                                final_is_thinking = False
+                                                final_summary_thinking = ""
+
+                                if chunk:
+                                    await self.emit_message_delta(chunk, final_message, __event_emitter__)
+
+                            except Exception as e:
+                                logger.error(f"Error in final summary call: {e}")
+                                await self.emit_message_delta(
+                                    f"\n\n⚠️ **Error generating final summary**: {str(e)}",
+                                    final_message,
+                                    __event_emitter__,
+                                )
+
+                            if self.valves.SHOW_TOOL_LIMIT_WARNINGS:
+                                await emit_event_local(
+                                    {
+                                        "type": "status",
+                                        "data": {
+                                            "description": f"✓ Complete (tool limit: {max_function_calls})",
+                                            "done": True,
+                                        },
+                                    }
+                                )
                             break
 
                         # Tools were already executed during stream (in message_delta)
@@ -3443,6 +3621,8 @@ class Pipe:
         try:
             # Extract model and messages from body
             actual_model_name = body["model"].split("/")[-1]
+            # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+            actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
             messages = body.get("messages", [])
 
             # Build simple payload for task request (non-streaming)
@@ -3466,7 +3646,8 @@ class Pipe:
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url)
 
             response = await client.messages.create(**task_payload)
 
@@ -3994,7 +4175,7 @@ class Pipe:
                 content = part.get("content", "")
                 result += (
                     f"\n<details>\n"
-                    f"<summary>🧠 Thoughts</summary>\n\n"
+                    f"<summary>Thoughts</summary>\n\n"
                     f"{content}\n"
                     f"</details>\n"
                 )
