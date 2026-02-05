@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.2-azure.13
+version: 0.6.2-azure.14-code-exec
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -46,6 +46,17 @@ Azure Modifications by DanCarrollAI:
 - Fixed infinite tool loop bug
 
 Changelog:
+v0.6.2-azure.14-code-exec (feature branch: code execution improvements)
+- **Added: Code execution status messages** - Shows what's happening during code execution
+  - 🖥️ Running: {command preview} - for bash_code_execution
+  - 📝 Creating: {filename} - for text_editor_code_execution create
+  - 👁️ Viewing: {filename} - for text_editor_code_execution view
+- **Added: File download from code execution** - Files created by code execution can be downloaded
+  - Downloads files from Anthropic's Files API
+  - Saves to OpenWebUI storage when available
+  - Returns markdown download link for easy access
+  - Graceful fallback when storage unavailable
+
 v0.6.2-azure.13
 - **Fixed: Intermediate model text disappearing** - Model commentary during tool loops now preserved
   - Text like "Great finds! Let me try..." was being redirected to status and then cleared
@@ -856,6 +867,131 @@ class Pipe:
 
     async def pipes(self) -> List[dict]:
         return await self.get_anthropic_models()
+
+    async def _generate_file_download_link(
+        self,
+        file_id: str,
+        api_key: str,
+        user_id: str
+    ) -> str:
+        """
+        Generate a download link for a file created by code execution.
+
+        Downloads the file from Anthropic's Files API and saves to OpenWebUI storage,
+        returning a markdown download link.
+
+        Args:
+            file_id: Anthropic file ID (e.g., "file_011CNha8iCJcU1wXNR6q4V8w")
+            api_key: Anthropic API key
+            user_id: OpenWebUI user ID for file ownership
+
+        Returns:
+            Markdown formatted download link or error message
+        """
+        import httpx
+        import uuid
+        import tempfile
+        import os
+
+        try:
+            # Step 1: Get file metadata from Anthropic
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "files-api-2025-04-14",
+            }
+
+            # First get file metadata to get filename
+            async with httpx.AsyncClient() as http_client:
+                # Get file info
+                metadata_response = await http_client.get(
+                    f"{base_url}/v1/files/{file_id}",
+                    headers=headers,
+                    timeout=30.0
+                )
+
+                if metadata_response.status_code != 200:
+                    logger.warning(f"Failed to get file metadata: {metadata_response.status_code}")
+                    return f"📎 *File: `{file_id}` (metadata unavailable)*"
+
+                file_metadata = metadata_response.json()
+                filename = file_metadata.get("filename", f"file_{file_id[:8]}")
+                mime_type = file_metadata.get("mime_type", "application/octet-stream")
+                downloadable = file_metadata.get("downloadable", True)
+
+                if not downloadable:
+                    logger.info(f"File {file_id} is not downloadable")
+                    return f"📎 *File: `{filename}` (not downloadable)*"
+
+                # Step 2: Download file content
+                content_response = await http_client.get(
+                    f"{base_url}/v1/files/{file_id}/content",
+                    headers=headers,
+                    timeout=60.0
+                )
+
+                if content_response.status_code != 200:
+                    logger.warning(f"Failed to download file content: {content_response.status_code}")
+                    return f"📎 *File: `{filename}` (download failed)*"
+
+                file_content = content_response.content
+                logger.debug(f"Downloaded {len(file_content)} bytes for {filename}")
+
+            # Step 3: Save to OpenWebUI storage (if available)
+            if FILES_AVAILABLE and Files and Storage:
+                try:
+                    # Generate a unique ID for the file
+                    openwebui_file_id = str(uuid.uuid4())
+
+                    # Save file content to temp file first
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as tmp_file:
+                        tmp_file.write(file_content)
+                        tmp_path = tmp_file.name
+
+                    try:
+                        # Upload to OpenWebUI storage
+                        storage_path = Storage.upload_file(tmp_path, filename)
+
+                        # Create file record in OpenWebUI
+                        file_record = Files.insert_new_file(
+                            user_id=user_id,
+                            form_data={
+                                "id": openwebui_file_id,
+                                "filename": filename,
+                                "path": storage_path,
+                                "meta": {
+                                    "name": filename,
+                                    "content_type": mime_type,
+                                    "size": len(file_content),
+                                    "source": f"anthropic_code_execution:{file_id}",
+                                }
+                            }
+                        )
+
+                        if file_record:
+                            # Return OpenWebUI download link
+                            download_url = f"/api/v1/files/{file_record.id}/content"
+                            logger.info(f"Saved file {filename} to OpenWebUI: {file_record.id}")
+                            return f"📎 [{filename}]({download_url})"
+
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+
+                except Exception as e:
+                    logger.warning(f"Failed to save to OpenWebUI storage: {e}")
+                    # Fall through to base64 fallback
+
+            # Step 4: Fallback - return file info without download link
+            # (File was created but we couldn't save it to OpenWebUI)
+            size_kb = len(file_content) / 1024
+            return f"📎 *File: `{filename}` ({size_kb:.1f} KB) - created by code execution*"
+
+        except Exception as e:
+            logger.error(f"Error generating file download link for {file_id}: {e}")
+            return f"📎 *File: `{file_id}` (error: {str(e)[:50]})*"
 
     def _get_pdf_base64_from_file_id(self, file_id: str) -> Optional[tuple[str, str]]:
         """
@@ -2726,7 +2862,21 @@ class Pipe:
                                                 try:
                                                     parsed = json.loads(server_tool_input_buffer)
                                                     if "command" in parsed:
-                                                        bash_execution_command = parsed["command"]
+                                                        new_command = parsed["command"]
+                                                        # Only emit status once when we get a new command
+                                                        if new_command and new_command != bash_execution_command:
+                                                            bash_execution_command = new_command
+                                                            # Show first line of command as preview
+                                                            preview = bash_execution_command.split('\n')[0][:60]
+                                                            if len(bash_execution_command) > 60 or '\n' in bash_execution_command:
+                                                                preview += "..."
+                                                            await emit_event_local({
+                                                                "type": "status",
+                                                                "data": {
+                                                                    "description": f"🖥️ Running: {preview}",
+                                                                    "done": False,
+                                                                },
+                                                            })
                                                         logger.debug(f"Bash execution command: {bash_execution_command[:100]}...")
                                                 except json.JSONDecodeError:
                                                     logger.debug(f"Partial bash_code_execution JSON: {server_tool_input_buffer[:100]}...")
@@ -2736,8 +2886,31 @@ class Pipe:
                                                 # Text editor input - extract command and file_text
                                                 try:
                                                     parsed = json.loads(server_tool_input_buffer)
-                                                    if "command" in parsed:
-                                                        text_editor_command = parsed["command"]
+                                                    new_command = parsed.get("command", "")
+                                                    new_file_path = parsed.get("file_path", "")
+
+                                                    # Emit status when command changes
+                                                    if new_command and new_command != text_editor_command:
+                                                        text_editor_command = new_command
+                                                        if text_editor_command == "create":
+                                                            file_name = new_file_path.split('/')[-1] if new_file_path else "file"
+                                                            await emit_event_local({
+                                                                "type": "status",
+                                                                "data": {
+                                                                    "description": f"📝 Creating: {file_name}",
+                                                                    "done": False,
+                                                                },
+                                                            })
+                                                        elif text_editor_command == "view":
+                                                            file_name = new_file_path.split('/')[-1] if new_file_path else "file"
+                                                            await emit_event_local({
+                                                                "type": "status",
+                                                                "data": {
+                                                                    "description": f"👁️ Viewing: {file_name}",
+                                                                    "done": False,
+                                                                },
+                                                            })
+
                                                     if "file_text" in parsed:
                                                         text_editor_file_content = parsed["file_text"]
                                                         logger.debug(f"Text editor creating file with {len(text_editor_file_content)} chars")
