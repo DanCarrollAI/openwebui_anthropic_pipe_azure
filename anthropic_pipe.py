@@ -1775,7 +1775,7 @@ class Pipe:
             # Check if last message has RAG content
             last_msg = processed_messages[-1]
             last_msg_content = last_msg.get("content", [])
-            
+
             # We want to exclude RAG content from caching, so place the cache breakpoint to the second last message if RAG is present
             has_rag_in_content = False
             for block in last_msg_content:
@@ -1784,7 +1784,11 @@ class Pipe:
                     if "<context>" in text or ("### Task:" in text and "<source" in text):
                         has_rag_in_content = True
                         break
-            target_msg = processed_messages[-2 if has_rag_in_content else -1]
+            # Only use -2 if we have at least 2 messages, otherwise fall back to -1
+            if has_rag_in_content and len(processed_messages) >= 2:
+                target_msg = processed_messages[-2]
+            else:
+                target_msg = processed_messages[-1]
             content_blocks = target_msg.get("content", [])
             if content_blocks:
                 last_content_block = content_blocks[-1]
