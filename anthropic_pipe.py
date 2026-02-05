@@ -1556,7 +1556,7 @@ class Pipe:
         system_messages, processed_messages, previous_marker_metadata = self._convert_messages_to_claude_format(raw_messages, user_has_memory_system_enabled)
         new_marker_metadata = ""
 
-        if __files__:
+        if __files__ and processed_messages:
             if __metadata__.get("activate_code_execution_tool", False):
                 # Process Files API data - uploads files and returns accumulated metadata
                 file_id_content_blocks, new_marker_metadata = await self._process_files_api_data(
