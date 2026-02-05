@@ -1404,11 +1404,12 @@ class Pipe:
         
         # Process new files
         api_key = self.valves.ANTHROPIC_API_KEY
+        base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
         client = None
         if api_key:
             try:
                 from anthropic import AsyncAnthropic
-                client = AsyncAnthropic(api_key=api_key)
+                client = AsyncAnthropic(api_key=api_key, base_url=base_url)
             except ImportError:
                 logger.warning("Anthropic SDK not available for file upload")
         
