@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.2-azure.12
+version: 0.6.2-azure.13
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -43,9 +43,15 @@ Azure Modifications by DanCarrollAI:
 - OpenWebUI builtin tools support (search_web, fetch_url, memory tools) with web search toggle gating
 - Friendly tool status messages (shows query/URL instead of generic "Executing tool")
 - Immediate thinking block display with proper collapsible formatting
-- Fixed infinite tool loop and intermediate text accumulation bugs
+- Fixed infinite tool loop bug
 
 Changelog:
+v0.6.2-azure.13
+- **Fixed: Intermediate model text disappearing** - Model commentary during tool loops now preserved
+  - Text like "Great finds! Let me try..." was being redirected to status and then cleared
+  - Now all model text is emitted to the response, providing useful context during multi-tool operations
+  - Users can see model's reasoning about blocked URLs, alternative approaches, etc.
+
 v0.6.2-azure.12
 - **Fixed: Tool search not finding builtin tools** - BM25/Regex tool_search now works with web search
   - Initialized tools array when only builtin tools exist (no __tools__ passed)
@@ -3272,39 +3278,23 @@ class Pipe:
                                     )
 
                             if chunk_count > token_buffer_size:
-                                # Buffer overflow - need to emit, but check if intermediate turn
+                                # Buffer overflow - emit to response
                                 if chunk.strip():
-                                    if has_pending_tool_calls:
-                                        # Intermediate turn - show as status, don't emit to response
-                                        status_text = chunk.strip()[:100] + "..." if len(chunk.strip()) > 100 else chunk.strip()
-                                        await emit_event_local({
-                                            "type": "status",
-                                            "data": {"description": f"💭 {status_text}", "done": False}
-                                        })
-                                    else:
-                                        # Final turn - emit to response
-                                        await self.emit_message_delta(
-                                            chunk, final_message, __event_emitter__
-                                        )
-                                        message_parts.append({"type": "text", "content": chunk})
+                                    # Always emit text to response - intermediate commentary is valuable
+                                    await self.emit_message_delta(
+                                        chunk, final_message, __event_emitter__
+                                    )
+                                    message_parts.append({"type": "text", "content": chunk})
                                     chunk = ""
                                     chunk_count = 0
 
-                    # Flush remaining chunk - check if intermediate or final turn
+                    # Flush remaining chunk - always emit to response
                     if chunk.strip():
-                        if has_pending_tool_calls and tool_calls:
-                            # Intermediate turn - show accumulated text as status, don't emit to response
-                            status_text = chunk.strip()[:100] + "..." if len(chunk.strip()) > 100 else chunk.strip()
-                            await emit_event_local({
-                                "type": "status",
-                                "data": {"description": f"💭 {status_text}", "done": False}
-                            })
-                        else:
-                            # Final turn - emit to response
-                            await self.emit_message_delta(
-                                chunk, final_message, __event_emitter__
-                            )
-                            message_parts.append({"type": "text", "content": chunk})
+                        # Always emit text to response - intermediate commentary is valuable
+                        await self.emit_message_delta(
+                            chunk, final_message, __event_emitter__
+                        )
+                        message_parts.append({"type": "text", "content": chunk})
                         chunk = ""
                         chunk_count = 0
 
@@ -3607,10 +3597,8 @@ class Pipe:
                         citation_counter = (
                             0  # Reset citation counter for next iteration
                         )
-                        # Clear any accumulated text from intermediate turns
-                        # (intermediate text is shown as status, not in response)
-                        final_message.clear()
-                        message_parts = [p for p in message_parts if p.get("type") != "text"]
+                        # Keep intermediate text in response - model's commentary provides useful context
+                        # (e.g., "Reddit blocked access, trying other sources...")
                         continue
 
                 # ---------------------------------------------------------
