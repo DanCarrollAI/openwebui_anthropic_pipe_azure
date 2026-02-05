@@ -1050,36 +1050,46 @@ class Pipe:
     def _get_full_context_pdfs(
         self,
         __files__: Optional[List[Dict[str, Any]]],
+        previous_marker_metadata: dict[str, Any] = None,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         """
         Extract PDFs from __files__ that should be uploaded as native documents.
-        
+
         Args:
             __files__: List of file objects from OpenWebUI
-            
+            previous_marker_metadata: Previously processed file metadata to avoid duplicates
+
         Returns:
-            tuple: (List of document blocks for Anthropic API, List of openwebui file ids processed as native PDFs)
+            tuple: (List of document blocks for Anthropic API, List of metadata markers)
         """
         pdf_documents = []
         markers = []
-        
+
         if not __files__ or not FILES_AVAILABLE:
             return pdf_documents, markers
-            
+
+        if previous_marker_metadata is None:
+            previous_marker_metadata = {}
+
         for file in __files__:
             # Only process files with 'full' context (not RAG chunks)
             if file.get("type") != "file" or file.get("context") != "full":
                 continue
-                
+
             file_id = file.get("id")
             if not file_id:
                 continue
-                
+
             # Check if it's a PDF
             file_name = file.get("name", "")
             if not file_name.lower().endswith(".pdf"):
                 continue
-                
+
+            # Skip if already processed in a previous turn
+            if file_name in previous_marker_metadata:
+                logger.debug(f"Skipping already processed PDF: {file_name}")
+                continue
+
             # Get base64 encoded PDF
             result = self._get_pdf_base64_from_file_id(file_id)
             if result:
@@ -1094,7 +1104,7 @@ class Pipe:
                     "title": filename,
                 })
                 markers.append(self._create_metadata_marker("pdf", f"{file_id}:{filename}"))
-                
+
         return pdf_documents, markers
     def _extract_rag_from_system_message(
         self, system_messages: List[Dict[str, Any]]
