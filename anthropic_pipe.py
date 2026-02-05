@@ -33,17 +33,42 @@ Supports:
 - Azure Anthropic API compatibility (date suffix stripping for model names)
 
 Azure Modifications by DanCarrollAI:
-- Added Azure Anthropic API compatibility
+
+**Core Azure Compatibility:**
+- Azure Anthropic API compatibility (works with Azure-hosted Claude endpoints)
 - Model name date suffix stripping for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
-- Added ANTHROPIC_API_BASE valve for custom endpoints (Azure, proxies)
-- Added ENABLED_MODELS valve to specify only deployed models (prevents auto-population of all models)
+- ANTHROPIC_API_BASE valve for custom endpoints (Azure, proxies, etc.)
+- ENABLED_MODELS valve to specify only deployed models (prevents auto-population)
+
+**Files API & Code Execution (v0.6.2-azure.14-code-exec):**
+- Fixed Files API to use Azure endpoint instead of hardcoded api.anthropic.com
+- Fixed file content blocks malformed error (.append → .extend for lists)
+- Added code execution status messages (🖥️ Running, 📝 Creating, 👁️ Viewing)
+- Implemented _generate_file_download_link method (was missing from upstream)
+- Fixed _get_full_context_pdfs missing previous_marker_metadata parameter
+
+**Builtin Tools & Tool Handling:**
+- OpenWebUI builtin tools support (search_web, fetch_url, memory tools)
+- Web search toggle gating (respects OpenWebUI's web search on/off)
+- Fixed infinite tool loop when tools not found in __tools__
+- Fixed tool_search not finding builtin tools (initialized tools array)
+- Friendly tool status messages (🔍 Searching: {query}, 🌐 Fetching: {url}, etc.)
+
+**Thinking & Streaming:**
+- Immediate thinking block display with proper collapsible <details> formatting
+- Fixed thinking blocks streaming to main output instead of collapsible
+- Fixed multiple "Thoughts" blocks appearing in tool loops
+- Intermediate model text preserved (no longer cleared between tool calls)
+
+**IndexError & Edge Case Fixes:**
+- Fixed processed_messages[-1] access when list empty
+- Fixed processed_messages[-2] access with single message + RAG content
+- Proper guards for all list index operations
+
+**User Experience:**
 - Changed default UserValves: ENABLE_THINKING=True, THINKING_BUDGET_TOKENS=20000, WEB_SEARCH_MAX_USES=8
-- Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
-- Added SHOW_TOOL_LIMIT_WARNINGS valve for cleaner UX
-- OpenWebUI builtin tools support (search_web, fetch_url, memory tools) with web search toggle gating
-- Friendly tool status messages (shows query/URL instead of generic "Executing tool")
-- Immediate thinking block display with proper collapsible formatting
-- Fixed infinite tool loop bug
+- SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility
+- SHOW_TOOL_LIMIT_WARNINGS valve for cleaner UX
 
 Changelog:
 v0.6.2-azure.14-code-exec (feature branch: code execution & Files API fixes)
