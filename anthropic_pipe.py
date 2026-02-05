@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.1-azure.10
+version: 0.6.2-azure.11
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -40,8 +40,49 @@ Azure Modifications by DanCarrollAI:
 - Changed default UserValves: ENABLE_THINKING=True, THINKING_BUDGET_TOKENS=20000, WEB_SEARCH_MAX_USES=8
 - Added SHOW_BUILTIN_TOOL_RESULTS valve to control tool result visibility in chat
 - Added SHOW_TOOL_LIMIT_WARNINGS valve for cleaner UX
+- OpenWebUI builtin tools support (search_web, fetch_url, memory tools) with web search toggle gating
+- Friendly tool status messages (shows query/URL instead of generic "Executing tool")
+- Immediate thinking block display with proper collapsible formatting
+- Fixed infinite tool loop and intermediate text accumulation bugs
 
 Changelog:
+v0.6.2-azure.11
+- **Fixed: Infinite tool loop bug** - When tools weren't found in __tools__, the loop would continue forever
+  - Added error handling for missing tools - returns error to model and increments counter
+  - Model receives feedback that tool isn't available, preventing repeated attempts
+- **Fixed: Builtin tools not executing** - Ported builtin tools support from dev branch
+  - Added `get_builtin_tools` import from OpenWebUI
+  - Added `__request__` parameter to pipe method for builtin tools context
+  - Tool lookup now checks both `__tools__` (user tools) AND `builtin_tools` (OpenWebUI builtins)
+  - Builtin tools (search_web, fetch_url, memory_query, etc.) now execute properly
+- **Fixed: Web search toggle not respected** - Builtin web tools now gated by OpenWebUI's toggle
+  - When web search toggle is OFF, search_web/fetch_url/web_search are removed from available tools
+- **Fixed: Thinking blocks streaming to main output** - Thinking now properly collapsible
+  - Thinking content accumulated during streaming, NOT emitted directly to response
+  - Shows "Thinking..." status during model reasoning
+  - Emits collapsible `<details><summary>Thoughts</summary>` block immediately when thinking ends
+  - Thinking block persists through final message formatting
+- **Fixed: Multiple "Thoughts" blocks appearing** - Only first thinking block shown to user
+  - Subsequent thinking blocks (from tool loops) preserved for API but not displayed
+- **Fixed: Intermediate filler text accumulating** - "I'll search for..." messages no longer pile up
+  - Text from intermediate tool turns shown as 💭 status message instead of response
+  - Only final response text appears in output
+- **Fixed: total_usage KeyError** - Properly initialized with all required keys (input_tokens, etc.)
+- **Improved: Friendly tool status messages** - More descriptive than generic "Executing tool:"
+  - 🔍 Searching: {query} (for search_web, web_search)
+  - 🌐 Fetching: {url} (for fetch_url)
+  - 📚 Searching knowledge: {query} (for query_knowledge_files)
+  - 🧠 Searching memory: {query} (for memory_query)
+  - 🧠 Saving to memory... (for memory_add)
+  - 🔧 Executing: {tool_name} (for other tools)
+- **Improved: Builtin tool result visibility** - Respects SHOW_BUILTIN_TOOL_RESULTS valve
+  - When False (default): builtin tool results fed to model silently for cleaner chat
+  - When True: shows raw JSON output in chat (useful for debugging)
+- **Improved: Status indicators** - Clear feedback during model processing
+  - "Thinking..." while model reasons
+  - "Responding..." when generating response
+  - Tool-specific status messages during execution
+
 v0.6.1-azure.10
 - Rebased Azure changes onto Podden's upstream beta (v0.6.1)
 - Includes Files API, Skills, Code Execution from upstream
@@ -268,7 +309,7 @@ logger = logging.getLogger(__name__)
 # Pattern to match thinking blocks in message content (for removal from history)
 # Matches: <details><summary>Thoughts...</summary>\n...\n</details>
 PATTERN_THINKING_BLOCK = re.compile(
-    r"<details>\s*<summary>Thoughts.*?</summary>.*?</details>\s*",
+    r"<details[^>]*>\s*<summary>Thoughts.*?</summary>.*?</details>\s*",
     flags=re.DOTALL
 )
 
@@ -323,6 +364,14 @@ except ImportError:
     Storage = None
     Path = None
     FILES_AVAILABLE = False
+
+# Import OpenWebUI builtin tools helper
+try:
+    from open_webui.utils.tools import get_builtin_tools
+    BUILTIN_TOOLS_AVAILABLE = True
+except ImportError:
+    get_builtin_tools = None
+    BUILTIN_TOOLS_AVAILABLE = False
 
 class Pipe:
     # Pre-compile static regex patterns for RAG message and <source> tags
@@ -1858,6 +1907,7 @@ class Pipe:
         __files__: Optional[Dict[str, Any]] = None,
         __task__: Optional[dict[str, Any]] = None,
         __task_body__: Optional[dict[str, Any]] = None,
+        __request__: Optional[Any] = None,
     ):
         """
         OpenWebUI Claude streaming pipe with integrated streaming logic.
@@ -1866,7 +1916,13 @@ class Pipe:
         # PHASE 1: RESPONSE ACCUMULATION STATE
         # =========================================================================
         final_message: list[str] = []
-        total_usage = {}
+        total_usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "total_tokens": 0,
+        }
 
         async def emit_event_local(event: dict):
             """Request-local event emitter wrapper"""
@@ -1903,6 +1959,41 @@ class Pipe:
             # STEP 2: Await tools if needed
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
+
+            # STEP 2.5: Get builtin tools from OpenWebUI (search_web, fetch_url, etc.)
+            builtin_tools = {}
+            if BUILTIN_TOOLS_AVAILABLE and __request__:
+                try:
+                    # Determine if memory feature is enabled
+                    memory_enabled = (
+                        __user__.get("settings", {}).get("ui", {}).get("memory", False)
+                        if __user__ else False
+                    )
+                    builtin_tools = get_builtin_tools(
+                        __request__,
+                        {
+                            "__user__": __user__,
+                            "__event_emitter__": __event_emitter__,
+                            "__chat_id__": __metadata__.get("chat_id") if __metadata__ else None,
+                            "__message_id__": __metadata__.get("message_id") if __metadata__ else None,
+                        },
+                        features={"memory": memory_enabled},
+                        model={},
+                    )
+                    logger.debug(f"Loaded {len(builtin_tools)} builtin tools: {list(builtin_tools.keys())}")
+                except Exception as e:
+                    logger.warning(f"Could not load builtin tools: {e}")
+                    builtin_tools = {}
+
+            # STEP 2.6: Gate builtin web tools by OpenWebUI's web search toggle
+            # When the toggle is OFF, remove search_web and fetch_url from builtin tools
+            features_web_search = __metadata__.get("features", {}).get("web_search", False) if __metadata__ else False
+            if not features_web_search and builtin_tools:
+                web_tools_to_remove = ["search_web", "fetch_url", "web_search"]
+                removed_tools = [t for t in web_tools_to_remove if t in builtin_tools]
+                if removed_tools:
+                    builtin_tools = {k: v for k, v in builtin_tools.items() if k not in web_tools_to_remove}
+                    logger.debug(f"Web search toggle OFF - removed builtin tools: {removed_tools}")
 
             # STEP 3: Auto-enable native function calling if tools are present
             # This prevents OpenWebUI's function_calling task system from being triggered
@@ -1949,58 +2040,6 @@ class Pipe:
             payload, headers, new_marker_metadata = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
             )
-            def _safe_json(obj: Any) -> Any:
-                """Recursively convert obj to JSON-serializable form."""
-
-                if isinstance(obj, (str, int, float, bool)) or obj is None:
-                    return obj
-                if isinstance(obj, dict):
-                    return {k: _safe_json(v) for k, v in obj.items()}
-                if isinstance(obj, list):
-                    return [_safe_json(v) for v in obj]
-                if hasattr(obj, "dict"):
-                    try:
-                        return _safe_json(obj.dict())
-                    except Exception:  # pragma: no cover - best effort
-                        pass
-                if hasattr(obj, "model_dump"):
-                    try:
-                        return _safe_json(obj.model_dump())
-                    except Exception:  # pragma: no cover - best effort
-                        pass
-                return f"<UNSERIALIZABLE {type(obj).__name__}>"
-            async def emit(name: str, value: Any) -> None:
-                if __event_emitter__ is None:
-                    return
-
-                serial = _safe_json(value)
-                await __event_emitter__(
-                    {
-                        "type": "citation",
-                        "data": {
-                            "document": [json.dumps(serial, indent=2)],
-                            "metadata": [
-                                {
-                                    "source": name,
-                                }
-                            ],
-                            "source": {"name": name},
-                        },
-                    }
-                )
-            if inspect.isawaitable(__tools__):
-                __tools__ = await __tools__
-            await emit("Payload", payload)
-            await emit("Headers", headers)
-            await emit("body", body)
-            await emit("__metadata__", __metadata__ or {})
-            await emit("__user__", __user__)
-            await emit("__files__", __files__ or [])
-            await emit("__tools__", __tools__ or {})
-            await emit("new_marker_metadata", new_marker_metadata or {})
-            if __task__:
-                await emit("__task__", __task_body__)
-            return "test"
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
             base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
             client = AsyncAnthropic(api_key=api_key, base_url=base_url, default_headers=headers)
@@ -2211,6 +2250,11 @@ class Pipe:
                                         "type": "thinking",
                                         "thinking": "",
                                     }
+                                    # Emit status to indicate model is thinking
+                                    await emit_event_local({
+                                        "type": "status",
+                                        "data": {"description": "Thinking...", "done": False}
+                                    })
                                 if content_type == "tool_use":
                                     tool_name = getattr(
                                         content_block, "name", "unknown"
@@ -2220,16 +2264,22 @@ class Pipe:
                                         f"🔧 Tool use block started: {tool_name}"
                                     )
 
-                                    # Emit status immediately when tool_use block starts (before input generation)
-                                    await emit_event_local(
-                                        {
-                                            "type": "status",
-                                            "data": {
-                                                "description": f"🔧 Executing tool: {tool_name}",
-                                                "done": False,
-                                            },
-                                        }
-                                    )
+                                    # For search/fetch/knowledge tools, skip generic status - we'll show query/URL later
+                                    # For other tools, show generic status since we don't have special handling
+                                    tools_with_friendly_status = {
+                                        "search_web", "web_search", "fetch_url",
+                                        "query_knowledge_files", "memory_query", "memory_add"
+                                    }
+                                    if tool_name not in tools_with_friendly_status:
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": f"🔧 Executing: {tool_name}",
+                                                    "done": False,
+                                                },
+                                            }
+                                        )
                                     tools_buffer = (
                                         "{"
                                         f'"type": "{content_block.type}", '
@@ -2548,11 +2598,8 @@ class Pipe:
                                     delta_type = getattr(delta, "type", None)
                                     if delta_type == "thinking_delta":
                                         thinking_text = getattr(delta, "thinking", "")
-                                        # Stream thinking text DIRECTLY to UI
-                                        await self.emit_message_delta(
-                                            thinking_text, final_message, __event_emitter__
-                                        )
-                                        # Preserve thinking for API
+                                        # Accumulate thinking for API and final formatting
+                                        # (NOT streamed directly - will be formatted with <details> at end)
                                         if current_thinking_block:
                                             current_thinking_block[
                                                 "thinking"
@@ -2834,13 +2881,69 @@ class Pipe:
                                             }
                                         )
 
-                                        # Look up tool
-                                        tool = __tools__.get(tool_name)
-                                        if tool:
+                                        # Emit friendly status messages for specific tools
+                                        if tool_name in ("search_web", "web_search"):
+                                            query = tool_input.get("query", tool_input.get("q", ""))
+                                            if query:
+                                                await emit_event_local({
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"🔍 Searching: {query[:80]}{'...' if len(query) > 80 else ''}",
+                                                        "done": False,
+                                                    }
+                                                })
+                                        elif tool_name == "fetch_url":
+                                            url = tool_input.get("url", "")
+                                            if url:
+                                                display_url = url[:60] + "..." if len(url) > 60 else url
+                                                await emit_event_local({
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"🌐 Fetching: {display_url}",
+                                                        "done": False,
+                                                    }
+                                                })
+                                        elif tool_name == "query_knowledge_files":
+                                            query = tool_input.get("query", tool_input.get("q", ""))
+                                            if query:
+                                                await emit_event_local({
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"📚 Searching knowledge: {query[:60]}{'...' if len(query) > 60 else ''}",
+                                                        "done": False,
+                                                    }
+                                                })
+                                        elif tool_name == "memory_query":
+                                            query = tool_input.get("query", "")
+                                            if query:
+                                                await emit_event_local({
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"🧠 Searching memory: {query[:60]}{'...' if len(query) > 60 else ''}",
+                                                        "done": False,
+                                                    }
+                                                })
+                                        elif tool_name == "memory_add":
+                                            await emit_event_local({
+                                                "type": "status",
+                                                "data": {
+                                                    "description": "🧠 Saving to memory...",
+                                                    "done": False,
+                                                }
+                                            })
+
+                                        # Look up tool in __tools__ first, then builtin_tools
+                                        tool = __tools__.get(tool_name) if __tools__ else None
+                                        is_builtin = False
+                                        if not tool and builtin_tools:
+                                            tool = builtin_tools.get(tool_name)
+                                            is_builtin = tool is not None
+
+                                        if tool and tool.get("callable"):
                                             # Store metadata for later result matching
                                             tool_call_data_list.append(tool_call_data)
 
-                                            # Start execution immediately as async task (no extra status event needed)
+                                            # Start execution immediately as async task
                                             args = (
                                                 tool_input
                                                 if isinstance(tool_input, dict)
@@ -2852,10 +2955,24 @@ class Pipe:
                                             running_tool_tasks.append(task)
 
                                             logger.debug(
-                                                f"🚀 Started immediate execution for '%s' (task #%d)",
+                                                f"🚀 Started immediate execution for {'builtin ' if is_builtin else ''}tool '%s' (task #%d)",
                                                 tool_name,
                                                 len(running_tool_tasks),
                                             )
+                                        else:
+                                            # Tool not found - add error result to prevent infinite loop
+                                            available = list(__tools__.keys()) if __tools__ else []
+                                            if builtin_tools:
+                                                available.extend(list(builtin_tools.keys()))
+                                            logger.warning(
+                                                f"⚠️ Tool '{tool_name}' not found in available tools. Adding error result."
+                                            )
+                                            tool_calls.append({
+                                                "type": "tool_result",
+                                                "tool_use_id": tool_id,
+                                                "content": f"Error: Tool '{tool_name}' is not available. Available tools: {available if available else 'none'}",
+                                                "is_error": True,
+                                            })
                                     except Exception as e:
                                         logger.error(
                                             f"Failed to start tool execution: {e}"
@@ -2871,20 +2988,34 @@ class Pipe:
                                         and current_thinking_block.get("thinking")
                                     ):
                                         thinking_blocks.append(current_thinking_block)
-                                        # Add to message_parts for final formatting
-                                        message_parts.append({
-                                            "type": "thinking",
-                                            "content": current_thinking_block.get("thinking", "")
-                                        })
+                                        # Only show FIRST thinking block (subsequent ones preserved for API but not shown)
+                                        has_thinking_in_parts = any(p.get("type") == "thinking" for p in message_parts)
+                                        thinking_content = current_thinking_block.get("thinking", "")
+
+                                        if not has_thinking_in_parts and thinking_content:
+                                            # Emit thinking block immediately as collapsible
+                                            wrapped_thinking = (
+                                                f"\n<details>\n<summary>Thoughts</summary>\n\n"
+                                                f"{thinking_content}\n"
+                                                f"</details>\n\n"
+                                            )
+                                            await self.emit_message_delta(
+                                                wrapped_thinking, final_message, __event_emitter__
+                                            )
+                                            # Track in message_parts for reference (already emitted)
+                                            message_parts.append({
+                                                "type": "thinking",
+                                                "content": thinking_content,
+                                                "emitted": True  # Mark as already emitted
+                                            })
                                         logger.debug(
-                                            f"Preserved thinking block with {len(current_thinking_block.get('thinking', ''))} chars"
+                                            f"Preserved thinking block with {len(thinking_content)} chars (shown: {not has_thinking_in_parts})"
                                         )
-                                    # Add separator after thinking (will be replaced at end)
-                                    await self.emit_message_delta(
-                                        "\n---\n",
-                                        final_message,
-                                        __event_emitter__,
-                                    )
+                                    # Clear "Thinking..." status now that thinking is done
+                                    await emit_event_local({
+                                        "type": "status",
+                                        "data": {"description": "Responding...", "done": False}
+                                    })
                                     is_model_thinking = False
                                     current_thinking_block = {}
 
@@ -2987,48 +3118,61 @@ class Pipe:
                                                         result_block["is_error"] = True
                                                     tool_calls.append(result_block)
 
-                                                    # Format and emit result to UI DIRECTLY (without <details>)
-                                                    try:
-                                                        parsed_json = json.loads(
-                                                            tool_result
-                                                        )
-                                                        formatted_result = f"```json\n{json.dumps(parsed_json, indent=2, ensure_ascii=False)}\n```"
-                                                    except Exception:
-                                                        formatted_result = f"```\n{str(tool_result)}\n```"
+                                                    # Determine if this is a builtin tool
+                                                    builtin_tool_names = {"search_web", "fetch_url", "web_search", "memory_query", "memory_add"}
+                                                    is_builtin_tool = tool_name in builtin_tool_names
 
-                                                    # Format tool input/parameters for display
-                                                    tool_input = tool_call_data.get(
-                                                        "input", {}
-                                                    )
-                                                    if tool_input:
+                                                    # Only emit tool results to UI if:
+                                                    # - It's a user-defined tool (always show), OR
+                                                    # - It's a builtin tool AND SHOW_BUILTIN_TOOL_RESULTS is True
+                                                    should_show_result = not is_builtin_tool or self.valves.SHOW_BUILTIN_TOOL_RESULTS
+
+                                                    if should_show_result:
+                                                        # Format and emit result to UI DIRECTLY (without <details>)
                                                         try:
-                                                            formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
+                                                            parsed_json = json.loads(
+                                                                tool_result
+                                                            )
+                                                            formatted_result = f"```json\n{json.dumps(parsed_json, indent=2, ensure_ascii=False)}\n```"
                                                         except Exception:
-                                                            formatted_input = f"```\n{str(tool_input)}\n```"
-                                                        input_section = f"**Input:**\n{formatted_input}\n\n"
-                                                    else:
-                                                        input_section = ""
+                                                            formatted_result = f"```\n{str(tool_result)}\n```"
 
-                                                    # Stream DIRECTLY without details wrapper
-                                                    tool_result_msg = (
-                                                        f"\n\n🔧 **{tool_name}**\n"
-                                                        f"{input_section}"
-                                                        f"**Output:**\n{formatted_result}\n"
-                                                    )
-                                                    await self.emit_message_delta(
-                                                        tool_result_msg,
-                                                        final_message,
-                                                        __event_emitter__,
-                                                    )
-                                                    
-                                                    # Track for final formatting with <details>
-                                                    message_parts.append({
-                                                        "type": "tool_result",
-                                                        "tool_name": tool_name,
-                                                        "input": tool_input,
-                                                        "output": str(tool_result),
-                                                        "is_error": is_error
-                                                    })
+                                                        # Format tool input/parameters for display
+                                                        tool_input = tool_call_data.get(
+                                                            "input", {}
+                                                        )
+                                                        if tool_input:
+                                                            try:
+                                                                formatted_input = f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
+                                                            except Exception:
+                                                                formatted_input = f"```\n{str(tool_input)}\n```"
+                                                            input_section = f"**Input:**\n{formatted_input}\n\n"
+                                                        else:
+                                                            input_section = ""
+
+                                                        # Stream DIRECTLY without details wrapper
+                                                        tool_result_msg = (
+                                                            f"\n\n🔧 **{tool_name}**\n"
+                                                            f"{input_section}"
+                                                            f"**Output:**\n{formatted_result}\n"
+                                                        )
+                                                        await self.emit_message_delta(
+                                                            tool_result_msg,
+                                                            final_message,
+                                                            __event_emitter__,
+                                                        )
+
+                                                        # Track for final formatting with <details>
+                                                        tool_input = tool_call_data.get("input", {})
+                                                        message_parts.append({
+                                                            "type": "tool_result",
+                                                            "tool_name": tool_name,
+                                                            "input": tool_input,
+                                                            "output": str(tool_result),
+                                                            "is_error": is_error
+                                                        })
+                                                    else:
+                                                        logger.debug(f"Builtin tool '{tool_name}' result fed to model silently (SHOW_BUILTIN_TOOL_RESULTS=False)")
                                             except Exception as ex:
                                                 logger.error(
                                                     f"❌ Tool execution failed: %s", ex
@@ -3101,20 +3245,39 @@ class Pipe:
                                     )
 
                             if chunk_count > token_buffer_size:
+                                # Buffer overflow - need to emit, but check if intermediate turn
                                 if chunk.strip():
-                                    await self.emit_message_delta(
-                                        chunk, final_message, __event_emitter__
-                                    )
-                                    message_parts.append({"type": "text", "content": chunk})
+                                    if has_pending_tool_calls:
+                                        # Intermediate turn - show as status, don't emit to response
+                                        status_text = chunk.strip()[:100] + "..." if len(chunk.strip()) > 100 else chunk.strip()
+                                        await emit_event_local({
+                                            "type": "status",
+                                            "data": {"description": f"💭 {status_text}", "done": False}
+                                        })
+                                    else:
+                                        # Final turn - emit to response
+                                        await self.emit_message_delta(
+                                            chunk, final_message, __event_emitter__
+                                        )
+                                        message_parts.append({"type": "text", "content": chunk})
                                     chunk = ""
                                     chunk_count = 0
 
-                    # Sende letzten Chunk, falls noch etwas übrig ist
+                    # Flush remaining chunk - check if intermediate or final turn
                     if chunk.strip():
-                        await self.emit_message_delta(
-                            chunk, final_message, __event_emitter__
-                        )
-                        message_parts.append({"type": "text", "content": chunk})
+                        if has_pending_tool_calls and tool_calls:
+                            # Intermediate turn - show accumulated text as status, don't emit to response
+                            status_text = chunk.strip()[:100] + "..." if len(chunk.strip()) > 100 else chunk.strip()
+                            await emit_event_local({
+                                "type": "status",
+                                "data": {"description": f"💭 {status_text}", "done": False}
+                            })
+                        else:
+                            # Final turn - emit to response
+                            await self.emit_message_delta(
+                                chunk, final_message, __event_emitter__
+                            )
+                            message_parts.append({"type": "text", "content": chunk})
                         chunk = ""
                         chunk_count = 0
 
@@ -3232,14 +3395,17 @@ class Pipe:
 
                                         elif event_type == "content_block_stop":
                                             if final_is_thinking and final_summary_thinking:
-                                                wrapped_thinking = (
-                                                    "\n<details>\n<summary>Thoughts</summary>\n\n"
-                                                    + final_summary_thinking
-                                                    + "\n</details>\n"
-                                                )
-                                                await self.emit_message_delta(
-                                                    wrapped_thinking, final_message, __event_emitter__
-                                                )
+                                                # Only show thinking if we haven't shown one already
+                                                has_thinking_in_parts = any(p.get("type") == "thinking" for p in message_parts)
+                                                if not has_thinking_in_parts:
+                                                    wrapped_thinking = (
+                                                        "\n<details>\n<summary>Thoughts</summary>\n\n"
+                                                        + final_summary_thinking
+                                                        + "\n</details>\n"
+                                                    )
+                                                    await self.emit_message_delta(
+                                                        wrapped_thinking, final_message, __event_emitter__
+                                                    )
                                                 await emit_event_local({
                                                     "type": "status",
                                                     "data": {"description": "Responding...", "done": False}
@@ -3414,6 +3580,10 @@ class Pipe:
                         citation_counter = (
                             0  # Reset citation counter for next iteration
                         )
+                        # Clear any accumulated text from intermediate turns
+                        # (intermediate text is shown as status, not in response)
+                        final_message.clear()
+                        message_parts = [p for p in message_parts if p.get("type") != "text"]
                         continue
 
                 # ---------------------------------------------------------
@@ -3561,6 +3731,15 @@ class Pipe:
             final_message.append(formatted_message)
             logger.debug(f"Replaced message with formatted version ({len(message_parts)} parts)")
             logger.debug(f"Final message (after): {final_text()[:200]}...")
+
+            # Emit chat:message to replace the entire streamed content with formatted version
+            # This ensures the thinking blocks appear in the proper UI element
+            await emit_event_local({
+                "type": "chat:message",
+                "data": {
+                    "content": formatted_message,
+                },
+            })
         
         final_status = "✅ Response Complete"
         # ============ Token Count Display ============
@@ -4172,6 +4351,7 @@ class Pipe:
                 i += 1
                 
             elif part_type == "thinking":
+                # Always include thinking in formatted message (chat:message replaces everything)
                 content = part.get("content", "")
                 result += (
                     f"\n<details>\n"
