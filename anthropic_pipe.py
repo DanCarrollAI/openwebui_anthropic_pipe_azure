@@ -46,16 +46,47 @@ Azure Modifications by DanCarrollAI:
 - Fixed infinite tool loop bug
 
 Changelog:
-v0.6.2-azure.14-code-exec (feature branch: code execution improvements)
-- **Added: Code execution status messages** - Shows what's happening during code execution
+v0.6.2-azure.14-code-exec (feature branch: code execution & Files API fixes)
+This branch contains fixes for code execution, Files API, and several upstream bugs.
+
+**New Features:**
+- **Code execution status messages** - Shows real-time status during code execution
   - 🖥️ Running: {command preview} - for bash_code_execution
   - 📝 Creating: {filename} - for text_editor_code_execution create
   - 👁️ Viewing: {filename} - for text_editor_code_execution view
-- **Added: File download from code execution** - Files created by code execution can be downloaded
-  - Downloads files from Anthropic's Files API
-  - Saves to OpenWebUI storage when available
-  - Returns markdown download link for easy access
-  - Graceful fallback when storage unavailable
+- **File download from code execution** - Files created by code execution can be downloaded
+  - Downloads files from Anthropic's Files API (`/v1/files/{file_id}/content`)
+  - Attempts to save to OpenWebUI storage for persistent access
+  - Returns markdown download link or informational fallback
+  - Graceful error handling when storage unavailable
+
+**Bug Fixes - Files API:**
+- **Fixed: Files API using wrong endpoint** - Was hitting `api.anthropic.com` instead of Azure
+  - `_process_files_api_data()` now uses `self.valves.ANTHROPIC_API_BASE` for file uploads
+  - Azure Anthropic endpoints now work correctly with Files API
+- **Fixed: File content blocks malformed** - `.append()` instead of `.extend()` created nested lists
+  - `file_id_content_blocks` is a list, was being appended as single item `[[{block}]]`
+  - Changed to `.extend()` to flatten properly: `[{block}]`
+  - Error was: `messages.4.content.1: Input should be a valid dictionary`
+
+**Bug Fixes - Method Signatures & IndexErrors:**
+- **Fixed: `_get_full_context_pdfs()` missing parameter** - Method signature mismatch
+  - Was defined with 2 params but called with 3 (`previous_marker_metadata`)
+  - Added `previous_marker_metadata` parameter with default `None`
+  - Now properly skips already-processed PDFs in multi-turn conversations
+- **Fixed: `_generate_file_download_link()` method missing** - AttributeError crash
+  - Method was called but never defined in upstream code
+  - Implemented full method: downloads from Anthropic, saves to OpenWebUI storage
+- **Fixed: IndexError `processed_messages[-1]`** - Empty list access
+  - Added guard: `if __files__ and processed_messages:` before accessing
+- **Fixed: IndexError `processed_messages[-2]`** - Single message with RAG content
+  - When `has_rag_in_content=True` but only 1 message, `[-2]` would fail
+  - Now checks `len(processed_messages) >= 2` before using `-2` index
+
+**Includes fixes from azure.13:**
+- **Intermediate model text preserved** - Model commentary during tool loops no longer disappears
+  - Text like "Great finds! Let me try..." was being redirected to status and cleared
+  - Now all model text emits to response, showing reasoning about blocked URLs, retries, etc.
 
 v0.6.2-azure.13
 - **Fixed: Intermediate model text disappearing** - Model commentary during tool loops now preserved
