@@ -1564,7 +1564,7 @@ class Pipe:
                     __files__, __user__, __event_emitter__, previous_marker_metadata
                 )
                 if file_id_content_blocks:
-                    processed_messages[-1]["content"].append(file_id_content_blocks)
+                    processed_messages[-1]["content"].extend(file_id_content_blocks)
 
             # Check if user wants native PDF upload instead of RAG text extraction
             elif __user__["valves"].USE_PDF_NATIVE_UPLOAD:
