@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.2-azure.11
+version: 0.6.2-azure.12
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -46,6 +46,12 @@ Azure Modifications by DanCarrollAI:
 - Fixed infinite tool loop and intermediate text accumulation bugs
 
 Changelog:
+v0.6.2-azure.12
+- **Fixed: Tool search not finding builtin tools** - BM25/Regex tool_search now works with web search
+  - Initialized tools array when only builtin tools exist (no __tools__ passed)
+  - Previously, if tool_search was enabled without explicit tools, payload had no "tools" key
+  - Builtin tools (search_web, fetch_url) now properly added to API payload for tool_search
+
 v0.6.2-azure.11
 - **Fixed: Infinite tool loop bug** - When tools weren't found in __tools__, the loop would continue forever
   - Added error handling for missing tools - returns error to model and increments counter
@@ -2044,6 +2050,27 @@ class Pipe:
             base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
             client = AsyncAnthropic(api_key=api_key, base_url=base_url, default_headers=headers)
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
+
+            # Add builtin tools to the payload's tools array (for tool_search to find them)
+            # Initialize tools array if it doesn't exist but we have builtin tools
+            if builtin_tools:
+                if "tools" not in payload_for_stream:
+                    payload_for_stream["tools"] = []
+                    logger.debug("Initialized tools array for builtin tools")
+
+                existing_tool_names = {t.get("name") for t in payload_for_stream["tools"] if isinstance(t, dict) and t.get("name")}
+                for tool_name, tool_data in builtin_tools.items():
+                    if tool_name not in existing_tool_names:
+                        # Convert builtin tool to Claude format
+                        tool_spec = tool_data.get("spec", {})
+                        if tool_spec:
+                            claude_tool = {
+                                "name": tool_spec.get("name", tool_name),
+                                "description": tool_spec.get("description", f"OpenWebUI builtin tool: {tool_name}"),
+                                "input_schema": tool_spec.get("parameters", {"type": "object", "properties": {}}),
+                            }
+                            payload_for_stream["tools"].append(claude_tool)
+                            logger.debug(f"Added builtin tool to payload: {tool_name}")
 
             # =========================================================================
             # PHASE 3: STREAMING STATE INITIALIZATION
