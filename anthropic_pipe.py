@@ -1550,6 +1550,7 @@ class Pipe:
         __tools__: Optional[Dict[str, Dict[str, Any]]],
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
         __files__: Optional[List[Dict[str, Any]]] = None,
+        builtin_tools: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> tuple[dict, dict, List[str]]:
         
         ## General payload creation
@@ -1629,14 +1630,15 @@ class Pipe:
                 if pdf_documents_content_blocks:
                     processed_messages[-1]["content"].extend(pdf_documents_content_blocks)
 
-        ## Tools Handling    
+        ## Tools Handling
         # Correct Order for Caching: Tools, System, Messages
         tools_list = self._convert_tools_to_claude_format(
             __tools__,
             body,
             actual_model_name,
             __user__,
-            __metadata__
+            __metadata__,
+            builtin_tools
             )
 
         activate_code_execution = __metadata__.get("activate_code_execution_tool", False)
@@ -1920,26 +1922,35 @@ class Pipe:
         body: Dict[str, Any],
         actual_model_name: str,
         __user__: Dict[str, Any],
-        __metadata__: dict[str, Any]
+        __metadata__: dict[str, Any],
+        builtin_tools: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> List[dict]:
         """
         Convert OpenWebUI tools format to Claude API format.
-        
+
         Extracts tool specs from TWO sources:
         1. body.tools - Built-in tools (OpenAI format specs only, no callables)
         2. __tools__ - User tools (specs + callables for execution)
-        
+
         Args:
             __tools__: Dict of user tools with callables from OpenWebUI
             body: Request body containing body.tools (built-in tool specs)
             actual_model_name: Model name for capability checking
             __user__: User dict for valve overrides
             __metadata__: Metadata dict for checking enforcement flags
+            builtin_tools: Dict of builtin tools with callables (for validation)
         Returns:
             list: Tools in Claude API format
         """
         claude_tools = []
         tool_names_seen = set()  # Track unique tool names
+
+        # Build set of actually executable tool names (from __tools__ and builtin_tools)
+        executable_tool_names = set(__tools__.keys()) if __tools__ else set()
+        if builtin_tools:
+            executable_tool_names.update(builtin_tools.keys())
+
+        logger.debug(f"Executable tools available: {executable_tool_names}")
 
         # Extract built-in tools from body.tools (OpenAI format)
         body_tools = body.get("tools", [])
@@ -1951,7 +1962,14 @@ class Pipe:
                     name = func.get("name")
                     if not name or name in tool_names_seen:
                         continue
-                    
+
+                    # CRITICAL FIX: Only add tools that are actually executable
+                    # This prevents OAuth MCP tools (e.g., Notion) from being advertised
+                    # to Claude when they can't actually be executed in the pipe context
+                    if name not in executable_tool_names:
+                        logger.debug(f"Skipping non-executable tool from body.tools: {name} (likely OAuth MCP tool without auth)")
+                        continue
+
                     # Convert OpenAI format to Claude format
                     claude_tool = {
                         "name": name,
@@ -2030,6 +2048,12 @@ class Pipe:
             for tool_name, tool_data in __tools__.items():
                 if not isinstance(tool_data, dict) or "spec" not in tool_data:
                     logger.debug(f"Skipping invalid tool: {tool_name} - missing spec")
+                    continue
+
+                # CRITICAL FIX: Only add tools that have a callable
+                # This prevents OAuth MCP tools from being advertised when they can't be executed
+                if not tool_data.get("callable"):
+                    logger.debug(f"Skipping non-executable tool from __tools__: {tool_name} (no callable - likely OAuth MCP tool without auth)")
                     continue
 
                 spec = tool_data["spec"]
@@ -2257,7 +2281,7 @@ class Pipe:
                     )
 
             payload, headers, new_marker_metadata = await self._create_payload(
-                body, __metadata__, __user__, __tools__, __event_emitter__, __files__
+                body, __metadata__, __user__, __tools__, __event_emitter__, __files__, builtin_tools
             )
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
             base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
@@ -2274,6 +2298,11 @@ class Pipe:
                 existing_tool_names = {t.get("name") for t in payload_for_stream["tools"] if isinstance(t, dict) and t.get("name")}
                 for tool_name, tool_data in builtin_tools.items():
                     if tool_name not in existing_tool_names:
+                        # Only add tools with callables (prevent OAuth MCP tools from being advertised)
+                        if not tool_data.get("callable"):
+                            logger.debug(f"Skipping non-executable builtin tool: {tool_name} (no callable)")
+                            continue
+
                         # Convert builtin tool to Claude format
                         tool_spec = tool_data.get("spec", {})
                         if tool_spec:
@@ -3237,17 +3266,32 @@ class Pipe:
                                                 len(running_tool_tasks),
                                             )
                                         else:
-                                            # Tool not found - add error result to prevent infinite loop
+                                            # Tool not found - need to add error result to prevent infinite loop
                                             available = list(__tools__.keys()) if __tools__ else []
                                             if builtin_tools:
                                                 available.extend(list(builtin_tools.keys()))
-                                            logger.warning(
-                                                f"⚠️ Tool '{tool_name}' not found in available tools. Adding error result."
-                                            )
+
+                                            # Provide helpful error message based on tool search state
+                                            if self.valves.ENABLE_TOOL_SEARCH:
+                                                error_msg = (
+                                                    f"Tool '{tool_name}' was found via tool search but is not available for execution. "
+                                                    f"This may be due to: (1) Missing OAuth authentication for MCP tools, "
+                                                    f"(2) Tool not properly registered, or (3) Tool requires different permissions. "
+                                                    f"Available executable tools: {available if available else 'none'}"
+                                                )
+                                                logger.warning(
+                                                    f"⚠️ Tool '{tool_name}' found via tool search but not executable (likely OAuth MCP tool without auth)"
+                                                )
+                                            else:
+                                                error_msg = f"Error: Tool '{tool_name}' is not available. Available tools: {available if available else 'none'}"
+                                                logger.warning(
+                                                    f"⚠️ Tool '{tool_name}' not found in available tools"
+                                                )
+
                                             tool_calls.append({
                                                 "type": "tool_result",
                                                 "tool_use_id": tool_id,
-                                                "content": f"Error: Tool '{tool_name}' is not available. Available tools: {available if available else 'none'}",
+                                                "content": error_msg,
                                                 "is_error": True,
                                             })
                                     except Exception as e:
