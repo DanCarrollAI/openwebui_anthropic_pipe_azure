@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.2-azure.14-code-exec
+version: 0.6.2-azure.15-oauth-fix
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -51,6 +51,7 @@ Azure Modifications by DanCarrollAI:
 - OpenWebUI builtin tools support (search_web, fetch_url, memory tools)
 - Web search toggle gating (respects OpenWebUI's web search on/off)
 - Fixed infinite tool loop when tools not found in __tools__
+- OAuth MCP tools support (Notion, etc.) - auto-detects and uses OpenWebUI's task system
 - Fixed tool_search not finding builtin tools (initialized tools array)
 - Friendly tool status messages (🔍 Searching: {query}, 🌐 Fetching: {url}, etc.)
 
@@ -71,6 +72,19 @@ Azure Modifications by DanCarrollAI:
 - SHOW_TOOL_LIMIT_WARNINGS valve for cleaner UX
 
 Changelog:
+v0.6.2-azure.15-oauth-fix (branch: fix/notion-oauth-mcp-infinite-loop)
+**Critical Bug Fix - OAuth MCP Tool Support:**
+- **Fixed: OAuth MCP tools (e.g., Notion) now work correctly** - Prevents infinite loops AND allows OAuth tools
+  - Root cause: Native function calling was auto-enabled, causing pipe to try executing OAuth MCP tools
+  - OAuth MCP tools require authentication only available in OpenWebUI's task system, not the pipe
+  - Pipe attempted execution → failed → Claude retried → infinite loop
+  - Solution: Detect OAuth MCP tools (tools without callables) and skip auto-enabling native function calling
+  - When OAuth tools present: OpenWebUI's task system handles tool execution (has OAuth auth) ✅
+  - When only regular tools: Native function calling auto-enabled for better performance ✅
+  - Best of both worlds: OAuth tools work via OpenWebUI, regular tools work natively
+  - Debug logs show: "Detected OAuth MCP tools without callables: [tool_names]. Skipping native function calling..."
+  - Location: anthropic_pipe.py:2248-2294 (auto-enable logic with OAuth detection)
+
 v0.6.2-azure.14-code-exec (feature branch: code execution & Files API fixes)
 This branch contains fixes for code execution, Files API, and several upstream bugs.
 
@@ -1963,12 +1977,9 @@ class Pipe:
                     if not name or name in tool_names_seen:
                         continue
 
-                    # CRITICAL FIX: Only add tools that are actually executable
-                    # This prevents OAuth MCP tools (e.g., Notion) from being advertised
-                    # to Claude when they can't actually be executed in the pipe context
-                    if name not in executable_tool_names:
-                        logger.debug(f"Skipping non-executable tool from body.tools: {name} (likely OAuth MCP tool without auth)")
-                        continue
+                    # NOTE: Include all tools from body.tools
+                    # OAuth MCP tools will be handled by OpenWebUI's task system
+                    # when native function calling is disabled
 
                     # Convert OpenAI format to Claude format
                     claude_tool = {
@@ -2050,11 +2061,9 @@ class Pipe:
                     logger.debug(f"Skipping invalid tool: {tool_name} - missing spec")
                     continue
 
-                # CRITICAL FIX: Only add tools that have a callable
-                # This prevents OAuth MCP tools from being advertised when they can't be executed
-                if not tool_data.get("callable"):
-                    logger.debug(f"Skipping non-executable tool from __tools__: {tool_name} (no callable - likely OAuth MCP tool without auth)")
-                    continue
+                # NOTE: We include ALL tools here, even OAuth MCP tools without callables
+                # When OAuth tools are present, we skip auto-enabling native function calling
+                # (see STEP 3 above), which allows OpenWebUI's task system to handle them
 
                 spec = tool_data["spec"]
 
@@ -2240,41 +2249,61 @@ class Pipe:
 
             # STEP 3: Auto-enable native function calling if tools are present
             # This prevents OpenWebUI's function_calling task system from being triggered
+            # EXCEPTION: If OAuth MCP tools are present (tools without callables),
+            # we MUST NOT enable native function calling, because those tools
+            # require OpenWebUI's task system to execute (which has OAuth auth)
             if __tools__ and MODELS_AVAILABLE:
                 try:
-                    # Get the OpenWebUI model ID from metadata
-                    openwebui_model_id = (
-                        __metadata__.get("model_id") if __metadata__ else None
-                    )
-                    if not openwebui_model_id and body and "model" in body:
-                        openwebui_model_id = body["model"]
+                    # Check if any OAuth MCP tools are present (tools without callables)
+                    has_oauth_mcp_tools = False
+                    oauth_tool_names = []
 
-                    if openwebui_model_id:
-                        model = Models.get_model_by_id(openwebui_model_id)
-                        if model:
-                            params = dict(model.params or {})
-                            if params.get("function_calling") != "native":
-                                logger.debug(
-                                    f"Auto-enabling native function calling for model: {openwebui_model_id}"
-                                )
+                    for tool_name, tool_data in __tools__.items():
+                        if isinstance(tool_data, dict) and not tool_data.get("callable"):
+                            has_oauth_mcp_tools = True
+                            oauth_tool_names.append(tool_name)
 
-                                # Notify user
-                                await emit_event_local(
-                                    {
-                                        "type": "notification",
-                                        "data": {
-                                            "type": "info",
-                                            "content": f"Enabling native function calling for model: {openwebui_model_id}. Please re-run your query.",
-                                        },
-                                    }
-                                )
+                    if has_oauth_mcp_tools:
+                        logger.debug(
+                            f"Detected OAuth MCP tools without callables: {oauth_tool_names}. "
+                            f"Skipping native function calling auto-enable to allow OpenWebUI's task system to handle OAuth authentication."
+                        )
+                        # Don't auto-enable - let OpenWebUI's function_calling task system handle it
+                    else:
+                        # No OAuth MCP tools - safe to auto-enable native function calling
+                        # Get the OpenWebUI model ID from metadata
+                        openwebui_model_id = (
+                            __metadata__.get("model_id") if __metadata__ else None
+                        )
+                        if not openwebui_model_id and body and "model" in body:
+                            openwebui_model_id = body["model"]
 
-                                params["function_calling"] = "native"
-                                form_data = model.model_dump()
-                                form_data["params"] = params
-                                Models.update_model_by_id(
-                                    openwebui_model_id, ModelForm(**form_data)
-                                )
+                        if openwebui_model_id:
+                            model = Models.get_model_by_id(openwebui_model_id)
+                            if model:
+                                params = dict(model.params or {})
+                                if params.get("function_calling") != "native":
+                                    logger.debug(
+                                        f"Auto-enabling native function calling for model: {openwebui_model_id}"
+                                    )
+
+                                    # Notify user
+                                    await emit_event_local(
+                                        {
+                                            "type": "notification",
+                                            "data": {
+                                                "type": "info",
+                                                "content": f"Enabling native function calling for model: {openwebui_model_id}. Please re-run your query.",
+                                            },
+                                        }
+                                    )
+
+                                    params["function_calling"] = "native"
+                                    form_data = model.model_dump()
+                                    form_data["params"] = params
+                                    Models.update_model_by_id(
+                                        openwebui_model_id, ModelForm(**form_data)
+                                    )
                 except Exception as e:
                     logger.warning(
                         f"Could not auto-enable native function calling: {e}"
