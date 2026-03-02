@@ -3,7 +3,7 @@ title: Anthropic API Integration (Azure Compatible)
 author: DanCarrollAI (https://github.com/DanCarrollAI)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.6.2-azure.15-oauth-fix
+version: 0.6.2-azure.20-opus46-1m
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -72,6 +72,59 @@ Azure Modifications by DanCarrollAI:
 - SHOW_TOOL_LIMIT_WARNINGS valve for cleaner UX
 
 Changelog:
+v0.6.2-azure.20-opus46-1m
+**Claude Opus 4.6 with 1M Context Support:**
+- Added Claude Opus 4.6 to MODEL_CAPABILITIES with `supports_1m_context: True`
+  - Enables 1M context window (beta) when ENABLE_1M_CONTEXT valve is enabled
+  - Model entry includes: max_tokens=64000, thinking, memory, vision, effort, programmatic calling
+- Added model alias: `claude-opus-4-6-latest` → `claude-opus-4-6`
+- Added INFO-level debug logging for 1M context header logic
+  - 🔍 Shows ENABLE_1M_CONTEXT valve status + model capability check
+  - ✅ Confirms when beta header `context-1m-2025-08-07` is added
+  - 📋 Shows final concatenated beta headers sent to API
+  - Location: anthropic_pipe.py:1843-1852
+- **Note**: Requires Anthropic Tier 4+ organization for 1M context access
+
+v0.6.2-azure.19-oauth-routing
+**OAuth Task Model Routing Valve:**
+- Added OAUTH_TASK_MODEL_ID valve to configure a model for OAuth tool execution
+- When OAuth tools detected + routing configured: Returns helpful error directing user to switch models
+- Recommended model must have Native Function Calling DISABLED
+- OpenWebUI's task system can then execute OAuth tools and inject results into context
+- **Note**: This is Option 2 (helpful error + manual switch). Option 1 (automatic HTTP routing to OpenWebUI API)
+  would require calling OpenWebUI's chat API from within the pipe. User feedback needed on preferred approach.
+
+v0.6.2-azure.18-oauth-explained
+**Root Cause Identified - OAuth MCP Tools Behavior Explained:**
+- **FINDING**: OpenWebUI intentionally passes EMPTY __tools__ dict when only OAuth MCP tools are present
+  - OAuth MCP tools (Notion, etc.) cannot be executed in pipe context (no OAuth session)
+  - OpenWebUI doesn't populate __tools__ with non-executable tools
+  - These tools are found later via tool_search and correctly rejected as non-executable
+- **Added explanatory logging**: Shows when __tools__ is empty and explains this is normal for OAuth tools
+- **No code changes needed**: The existing v0.6.2-azure.15-oauth-fix logic works correctly
+  - Empty __tools__ → no auto-enable of native function calling ✓
+  - Tool search finds OAuth tools → pipe rejects them as non-executable ✓
+  - User gets clear error message about authentication requirements ✓
+
+v0.6.2-azure.17-diagnostics
+**Diagnostic Logging for OAuth Detection Issue:**
+- Added pre-check logging BEFORE the OAuth detection condition
+  - Shows whether __tools__ is None, its type, and length
+  - Shows MODELS_AVAILABLE value
+  - Helps diagnose why OAuth detection code wasn't running in v0.6.2-azure.16-logging
+  - Location: anthropic_pipe.py:2265 (before the if condition)
+  - This reveals which part of the condition (__tools__ or MODELS_AVAILABLE) is failing
+
+v0.6.2-azure.16-logging
+**Enhanced Logging for OAuth MCP Tool Detection:**
+- Added logger.info() statements to OAuth detection logic for easier debugging
+  - Shows number of tools found in __tools__
+  - Shows each tool being examined with callable status
+  - Shows OAuth tool detection results
+  - Shows when native function calling is auto-enabled
+  - No need to enable DEBUG logging - info level messages visible by default
+  - Location: anthropic_pipe.py:2256, 2263, 2269, 2288
+
 v0.6.2-azure.15-oauth-fix (branch: fix/notion-oauth-mcp-infinite-loop)
 **Critical Bug Fix - OAuth MCP Tool Support:**
 - **Fixed: OAuth MCP tools (e.g., Notion) now work correctly** - Prevents infinite loops AND allows OAuth tools
@@ -612,6 +665,16 @@ class Pipe:
             "supports_vision": True,
             "supports_effort": True,
             "supports_programmatic_calling": True,
+        },
+        "claude-opus-4-6": {
+            "max_tokens": 64000,
+            "context_length": 200000,
+            "supports_thinking": True,
+            "supports_1m_context": True,
+            "supports_memory": True,
+            "supports_vision": True,
+            "supports_effort": True,
+            "supports_programmatic_calling": True,
         }
     }
     
@@ -629,6 +692,7 @@ class Pipe:
         "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
         "claude-haiku-4-5": "claude-haiku-4-5-20251001",
         "claude-opus-4-5": "claude-opus-4-5-20251101",
+        "claude-opus-4-6-latest": "claude-opus-4-6",
     }
 
     REQUEST_TIMEOUT = (
@@ -788,6 +852,16 @@ class Pipe:
         CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT: bool = Field(
             default=False,
             description="Also clear tool input parameters when clearing tool results.",
+        )
+        # OAuth Task Model Routing
+        OAUTH_TASK_MODEL_ID: str = Field(
+            default="",
+            description=(
+                "OpenWebUI model ID to route OAuth tool requests to (e.g., 'claude-sonnet-4-5'). "
+                "⚠️ CRITICAL: This model MUST have 'Native Function Calling' DISABLED in OpenWebUI model settings. "
+                "When disabled, OpenWebUI's task system executes OAuth tools (has OAuth auth) and injects results into context. "
+                "Leave empty to disable OAuth task model routing (OAuth tools will fail with authentication errors)."
+            ),
         )
 
     class UserValves(BaseModel):
@@ -1779,8 +1853,10 @@ class Pipe:
                 payload["context_management"] = {"edits": context_management}
 
         # Add 1M context header if enabled and model supports it
+        logger.info(f"🔍 1M Context Check: ENABLE_1M_CONTEXT={self.valves.ENABLE_1M_CONTEXT}, supports_1m_context={model_info['supports_1m_context']}, model={actual_model_name}")
         if self.valves.ENABLE_1M_CONTEXT and model_info["supports_1m_context"]:
             beta_headers.append("context-1m-2025-08-07")
+            logger.info(f"✅ Added 1M context beta header for {actual_model_name}")
 
         # Add effort beta header and output_config if effort is configured
         if model_info["supports_effort"] and effort_config:
@@ -1791,6 +1867,7 @@ class Pipe:
             headers["anthropic-beta"] = ",".join(beta_headers)
             # Add betas list to payload for beta.messages.stream
             payload["betas"] = beta_headers
+            logger.info(f"📋 Final beta headers: {headers['anthropic-beta']}")
 
 
 
@@ -2252,22 +2329,81 @@ class Pipe:
             # EXCEPTION: If OAuth MCP tools are present (tools without callables),
             # we MUST NOT enable native function calling, because those tools
             # require OpenWebUI's task system to execute (which has OAuth auth)
+            logger.info(f"STEP 3 PRE-CHECK: __tools__ is None: {__tools__ is None}, __tools__ type: {type(__tools__)}, __tools__ length: {len(__tools__) if __tools__ else 0}, MODELS_AVAILABLE: {MODELS_AVAILABLE}")
+
+            # If __tools__ is empty, OAuth MCP tools may still be available via tool_search
+            # OpenWebUI doesn't populate __tools__ with OAuth MCP tools because they can't be executed in pipe context
+            if __tools__ is not None and len(__tools__) == 0:
+                logger.info("STEP 3: __tools__ is empty - this is normal for OAuth MCP tools. They will be found via tool_search and rejected as non-executable.")
+
+                # Check if OAuth task model routing is configured
+                if self.valves.OAUTH_TASK_MODEL_ID:
+                    oauth_model_id = self.valves.OAUTH_TASK_MODEL_ID.strip()
+                    if oauth_model_id:
+                        error_msg = (
+                            f"⚠️ **OAuth Tools Detected**\n\n"
+                            f"This model has Native Function Calling enabled, which cannot execute OAuth MCP tools (like Notion).\n\n"
+                            f"**To use OAuth tools:**\n"
+                            f"1. Switch to model: `{oauth_model_id}`\n"
+                            f"2. Ensure that model has 'Native Function Calling' **DISABLED**\n"
+                            f"3. OpenWebUI's task system will then execute OAuth tools and inject results into context\n\n"
+                            f"**Why this is needed:** OAuth MCP tools require authentication only available in OpenWebUI's task system, not in the pipe's execution context."
+                        )
+                        logger.info(f"Returning OAuth routing error. Suggested model: {oauth_model_id}")
+                        await emit_event_local(
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"OAuth tools require model: {oauth_model_id}",
+                                    "done": True,
+                                },
+                            }
+                        )
+                        return error_msg
+
             if __tools__ and MODELS_AVAILABLE:
+                logger.info(f"STEP 3: Found {len(__tools__)} tools in __tools__")
                 try:
                     # Check if any OAuth MCP tools are present (tools without callables)
                     has_oauth_mcp_tools = False
                     oauth_tool_names = []
 
                     for tool_name, tool_data in __tools__.items():
+                        logger.info(f"Examining tool: {tool_name}, has_callable: {bool(tool_data.get('callable') if isinstance(tool_data, dict) else False)}")
                         if isinstance(tool_data, dict) and not tool_data.get("callable"):
                             has_oauth_mcp_tools = True
                             oauth_tool_names.append(tool_name)
 
                     if has_oauth_mcp_tools:
-                        logger.debug(
+                        logger.info(
                             f"Detected OAuth MCP tools without callables: {oauth_tool_names}. "
                             f"Skipping native function calling auto-enable to allow OpenWebUI's task system to handle OAuth authentication."
                         )
+
+                        # Check if OAuth task model routing is configured
+                        if self.valves.OAUTH_TASK_MODEL_ID:
+                            oauth_model_id = self.valves.OAUTH_TASK_MODEL_ID.strip()
+                            if oauth_model_id:
+                                error_msg = (
+                                    f"⚠️ **OAuth Tools Detected: {', '.join(oauth_tool_names)}**\n\n"
+                                    f"This model has Native Function Calling enabled, which cannot execute OAuth MCP tools.\n\n"
+                                    f"**To use these OAuth tools:**\n"
+                                    f"1. Switch to model: `{oauth_model_id}`\n"
+                                    f"2. Ensure that model has 'Native Function Calling' **DISABLED**\n"
+                                    f"3. OpenWebUI's task system will execute OAuth tools and inject results into context\n\n"
+                                    f"**Why this is needed:** OAuth MCP tools require authentication only available in OpenWebUI's task system, not in the pipe's execution context."
+                                )
+                                logger.info(f"Returning OAuth routing error. OAuth tools: {oauth_tool_names}, Suggested model: {oauth_model_id}")
+                                await emit_event_local(
+                                    {
+                                        "type": "status",
+                                        "data": {
+                                            "description": f"OAuth tools require model: {oauth_model_id}",
+                                            "done": True,
+                                        },
+                                    }
+                                )
+                                return error_msg
                         # Don't auto-enable - let OpenWebUI's function_calling task system handle it
                     else:
                         # No OAuth MCP tools - safe to auto-enable native function calling
@@ -2283,7 +2419,7 @@ class Pipe:
                             if model:
                                 params = dict(model.params or {})
                                 if params.get("function_calling") != "native":
-                                    logger.debug(
+                                    logger.info(
                                         f"Auto-enabling native function calling for model: {openwebui_model_id}"
                                     )
 
