@@ -1,10 +1,10 @@
 """
-title: Anthropic API Integration
+title: Anthropic API Integration (Azure Compatible)
 id: anthropic_new
-author: Podden (https://github.com/Podden/)
+author: Podden (https://github.com/Podden/) - Azure modifications by DanCarrollAI
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.5
+version: 0.8.5-azure.1-minimal
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -36,7 +36,20 @@ Supports:
 - Memory Tool (integrated with OpenWebUI memory system)
 - Programmatic Tool Calling (tools callable from code execution)
 
+Azure Compatibility (DanCarrollAI):
+- ANTHROPIC_API_BASE valve for custom endpoints (Azure, proxies, etc.)
+- Model name date suffix stripping for Azure deployments (e.g., claude-opus-4-6-20260101 → claude-opus-4-6)
+- ENABLED_MODELS valve to specify only deployed models
+
 Changelog:
+v0.8.5-azure.1-minimal
+**Minimal Azure Compatibility Changes:**
+- Added ANTHROPIC_API_BASE valve for custom API endpoints
+- Added ENABLED_MODELS valve to specify deployed models only
+- Added automatic model name date suffix stripping for Azure deployments
+- Updated all AsyncAnthropic client instantiations to use base_url parameter
+- Based on upstream v0.8.5
+
 v0.8.5
 - Refactored: Cache control logic consolidated into single `_apply_cache_control()` method
   - All scattered cache_control placement removed from `_create_payload()` and tool loop
@@ -583,6 +596,14 @@ class Pipe:
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
+        ANTHROPIC_API_BASE: str = Field(
+            default="https://api.anthropic.com",
+            description="Base URL for Anthropic API. For Azure: https://<resource>.cognitiveservices.azure.com/anthropic",
+        )
+        ENABLED_MODELS: str = Field(
+            default="",
+            description="Comma-separated list of model names to enable (e.g., 'claude-sonnet-4,claude-opus-4'). Leave empty to auto-fetch from API or use all static models.",
+        )
         ENABLE_FAST_MODE: bool = Field(
             default=False,
             description="Enable Fast Mode for Opus 4.6. Up to 2.5x faster output at higher costs",
@@ -791,13 +812,36 @@ class Pipe:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
         Fallback to static list on error. Returns OpenWebUI model dicts.
+
+        If ENABLED_MODELS valve is set, only returns those specific models.
         """
         from anthropic import AsyncAnthropic
 
         models = []
+
+        # If ENABLED_MODELS is specified, only return those models
+        if self.valves.ENABLED_MODELS.strip():
+            enabled_list = [m.strip() for m in self.valves.ENABLED_MODELS.split(",") if m.strip()]
+            for name in enabled_list:
+                info = self.get_model_info(name)
+                models.append(
+                    {
+                        "id": f"anthropic/{name}",
+                        "name": name,
+                        "context_length": info["context_length"],
+                        "supports_vision": info["supports_vision"],
+                        "supports_thinking": info["supports_thinking"],
+                        "is_hybrid_model": info["supports_thinking"],
+                        "max_output_tokens": info["max_tokens"],
+                        "info": {"meta": {"capabilities": {"status_updates": True}}},
+                    }
+                )
+            return models
+
         try:
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url)
             async for m in client.models.list():
                 name = m.id
                 display_name = getattr(m, "display_name", name)
@@ -1264,7 +1308,8 @@ class Pipe:
             import hashlib
             import uuid
 
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url)
 
             # Get file metadata first
             file_meta = await client.beta.files.retrieve_metadata(file_id=file_id)
@@ -1342,7 +1387,8 @@ class Pipe:
         client = None
         try:
             from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY, base_url=base_url)
         except ImportError:
             logger.warning("Anthropic SDK not available for file upload")
             return blocks_by_user_msg, processed_filenames
@@ -1607,6 +1653,8 @@ class Pipe:
 
         ## General payload creation
         actual_model_name = body["model"].split("/")[-1]
+        # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+        actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
         model_info = self.get_model_info(actual_model_name)
         max_tokens_limit = model_info["max_tokens"]
         requested_max_tokens = body.get("max_tokens", max_tokens_limit)
@@ -2839,7 +2887,8 @@ class Pipe:
             # PHASE 3: STREAMING STATE INITIALIZATION
             # =========================================================================
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url, default_headers=headers)
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
             include_usage = body.get("stream_options", {}).get("include_usage", False)
             if include_usage:
@@ -4832,6 +4881,8 @@ class Pipe:
         try:
             # Extract model and messages from body
             actual_model_name = body["model"].split("/")[-1]
+            # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+            actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
             messages = body.get("messages", [])
 
             # Build simple payload for task request (non-streaming)
@@ -4847,7 +4898,8 @@ class Pipe:
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url)
 
             response = await client.messages.create(**task_payload)
 
@@ -5700,7 +5752,8 @@ class Pipe:
             try:
                 from anthropic import AsyncAnthropic
 
-                client = AsyncAnthropic(api_key=api_key)
+                base_url = self.valves.ANTHROPIC_API_BASE.rstrip("/")
+                client = AsyncAnthropic(api_key=api_key, base_url=base_url)
 
                 # Fetch all available skills
                 available_skills = {}
