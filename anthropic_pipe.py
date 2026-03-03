@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/) - Azure modifications by DanCarrollAI
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.5-azure.3
+version: 0.8.5-azure.4
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -42,6 +42,17 @@ Azure Compatibility (DanCarrollAI):
 - ENABLED_MODELS valve to specify only deployed models
 
 Changelog:
+v0.8.5-azure.4
+**Builtin Tool UX Improvements:**
+- Added friendly status messages for builtin tools (appear in status section, not main chat):
+  - 🔍 Searching: {query} (for search_web)
+  - 🌐 Fetching: {url} (for fetch_url)
+  - 📚 Searching knowledge: {query} (for query_knowledge_files)
+  - 💬 Searching chats: {query} (for search_chats, view_chat)
+  - 🧠 Searching memory: {query} (for memory_query)
+  - 🧠 Saving to memory... (for memory_add)
+- Suppressed generic "Executing tool:" messages for builtin tools when friendly status is available
+
 v0.8.5-azure.3
 **Builtin Tool UX Improvement:**
 - Fixed: Builtin tool results now display in citation panel instead of main chat stream
@@ -3233,15 +3244,21 @@ class Pipe:
                                             }
                                         )
                                     else:
-                                        await emit_event_local(
-                                            {
-                                                "type": "status",
-                                                "data": {
-                                                    "description": f"🔧 Executing tool: {tool_name}",
-                                                    "done": False,
-                                                },
-                                            }
-                                        )
+                                        # Check if it's a builtin tool for friendly status messages
+                                        if tool_name in builtin_tools:
+                                            # Builtin tool - will emit friendly status after input arrives
+                                            pass
+                                        else:
+                                            # User-defined tool - emit generic status
+                                            await emit_event_local(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": f"🔧 Executing tool: {tool_name}",
+                                                        "done": False,
+                                                    },
+                                                }
+                                            )
 
                                     # For programmatic tool calls, the API may provide
                                     # the full input at content_block_start (no input_json_delta events)
@@ -4065,6 +4082,39 @@ class Pipe:
                                         # Store tool_use block for assistant message
                                         # Note: tool_use block with caller field is preserved
                                         # by SDK accumulated message automatically
+
+                                        # Emit friendly status for builtin tools now that we have the input
+                                        if tool_name in builtin_tools:
+                                            friendly_status = None
+                                            if tool_name == "search_web":
+                                                query = tool_input.get("query", "")[:50]
+                                                friendly_status = f"🔍 Searching: {query}{'...' if len(tool_input.get('query', '')) > 50 else ''}"
+                                            elif tool_name == "fetch_url":
+                                                url = tool_input.get("url", "")[:60]
+                                                friendly_status = f"🌐 Fetching: {url}{'...' if len(tool_input.get('url', '')) > 60 else ''}"
+                                            elif tool_name == "query_knowledge_files":
+                                                query = tool_input.get("query", "")[:50]
+                                                friendly_status = f"📚 Searching knowledge: {query}{'...' if len(tool_input.get('query', '')) > 50 else ''}"
+                                            elif tool_name in ("search_chats", "view_chat"):
+                                                query = tool_input.get("query", "") or tool_input.get("id", "")
+                                                query_str = str(query)[:50]
+                                                friendly_status = f"💬 Searching chats: {query_str}{'...' if len(str(query)) > 50 else ''}"
+                                            elif tool_name == "memory_query":
+                                                query = tool_input.get("query", "")[:50]
+                                                friendly_status = f"🧠 Searching memory: {query}{'...' if len(tool_input.get('query', '')) > 50 else ''}"
+                                            elif tool_name == "memory_add":
+                                                friendly_status = "🧠 Saving to memory..."
+
+                                            if friendly_status:
+                                                await emit_event_local(
+                                                    {
+                                                        "type": "status",
+                                                        "data": {
+                                                            "description": friendly_status,
+                                                            "done": False,
+                                                        },
+                                                    }
+                                                )
 
                                         # Look up tool in __tools__ first (user tools with callable)
                                         tool = (
