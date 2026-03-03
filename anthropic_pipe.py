@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/) - Azure modifications by DanCarrollAI
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.5-azure.4
+version: 0.8.5-azure.5
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -42,6 +42,15 @@ Azure Compatibility (DanCarrollAI):
 - ENABLED_MODELS valve to specify only deployed models
 
 Changelog:
+v0.8.5-azure.5
+**Citation Panel Formatting:**
+- Improved citation panel display for builtin tools
+- search_web: Now displays as numbered markdown list with clickable titles and clean snippets
+  - Strips HTML tags from snippets (no more `<strong>`, `<em>`, etc.)
+  - No more raw JSON brackets
+- fetch_url: Cleanly displays errors or content without JSON braces
+- Makes Sources section much more readable and user-friendly
+
 v0.8.5-azure.4
 **Builtin Tool UX Improvements:**
 - Added friendly status messages for builtin tools (appear in status section, not main chat):
@@ -5797,18 +5806,64 @@ class Pipe:
         This keeps web search and other builtin tool results out of the main chat stream
         and displays them in the collapsible citation area instead.
         """
-        # Format tool result for display
+        # Format tool result for display based on tool type
         try:
-            # Try to pretty-print JSON results
+            # Parse JSON if it's a string
             if isinstance(tool_result, str):
                 try:
                     parsed = json.loads(tool_result)
-                    result_display = json.dumps(parsed, indent=2, ensure_ascii=False)
                 except (json.JSONDecodeError, ValueError):
-                    result_display = tool_result
+                    parsed = tool_result
             else:
-                result_display = json.dumps(tool_result, indent=2, ensure_ascii=False)
-        except Exception:
+                parsed = tool_result
+
+            # Format based on tool type
+            if tool_name == "search_web":
+                # Format search results as markdown list
+                if isinstance(parsed, list):
+                    result_parts = []
+                    for idx, item in enumerate(parsed, 1):
+                        if isinstance(item, dict):
+                            title = item.get("title", "No title")
+                            link = item.get("link", "")
+                            snippet = item.get("snippet", "")
+
+                            # Format as markdown
+                            result_parts.append(f"**{idx}. [{title}]({link})**")
+                            if snippet:
+                                # Strip HTML tags from snippet
+                                clean_snippet = re.sub(r'<[^>]+>', '', snippet)
+                                result_parts.append(f"   {clean_snippet}")
+                            result_parts.append("")  # Empty line between results
+
+                    result_display = "\n".join(result_parts).strip()
+                else:
+                    result_display = str(parsed)
+
+            elif tool_name == "fetch_url":
+                # Format fetch results - handle errors and content
+                if isinstance(parsed, dict):
+                    if "error" in parsed:
+                        # Show error cleanly
+                        error_msg = parsed["error"]
+                        result_display = f"**Error fetching URL:**\n\n{error_msg}"
+                    elif "content" in parsed:
+                        # Show content
+                        result_display = parsed["content"]
+                    else:
+                        # Show whole dict formatted
+                        result_display = json.dumps(parsed, indent=2, ensure_ascii=False)
+                else:
+                    result_display = str(parsed)
+
+            else:
+                # For other tools, pretty-print JSON
+                if isinstance(parsed, str):
+                    result_display = parsed
+                else:
+                    result_display = json.dumps(parsed, indent=2, ensure_ascii=False)
+
+        except Exception as e:
             result_display = str(tool_result)
 
         # Build source name based on tool type
