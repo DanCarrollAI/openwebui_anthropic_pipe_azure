@@ -331,11 +331,19 @@ from anthropic import (
     AuthenticationError,
     BadRequestError,
     InternalServerError,
-    OverloadedError,
     PermissionDeniedError,
     NotFoundError,
     UnprocessableEntityError,
 )
+
+# OverloadedError is only available in newer versions of anthropic SDK
+try:
+    from anthropic import OverloadedError
+except ImportError:
+    # Fallback for older SDK versions - create a placeholder that will never match
+    class OverloadedError(Exception):
+        """Placeholder for OverloadedError in older anthropic SDK versions"""
+        pass
 from typing import Literal
 from fastapi import Request
 
