@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/) - Azure modifications by DanCarrollAI
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.5-azure.2
+version: 0.8.5-azure.3
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -42,6 +42,18 @@ Azure Compatibility (DanCarrollAI):
 - ENABLED_MODELS valve to specify only deployed models
 
 Changelog:
+v0.8.5-azure.3
+**Builtin Tool UX Improvement:**
+- Fixed: Builtin tool results now display in citation panel instead of main chat stream
+  - Problem: Results from search_web/fetch_url were appearing as raw JSON in chat stream
+  - Solution: Builtin tool results now emit as "source" events → appear in collapsible citation panel
+  - User-defined tools still show in main chat as before (no behavior change)
+  - Benefits:
+    * Cleaner chat interface - tool results don't clutter main conversation
+    * Results still accessible via citation panel when needed
+  - Technical: Builtin tools identified by checking if tool_name in builtin_tools dict
+  - Source events use tool-specific icons: 🔍 search_web, 🌐 fetch_url, 📚 knowledge, 🧠 memory
+
 v0.8.5-azure.2
 **OpenWebUI v0.8.5 Compatibility Fix:**
 - Fixed: OpenWebUI built-in tools (search_web, fetch_url, image_generation) not executing
@@ -4317,8 +4329,17 @@ class Pipe:
                                                             "result": result_str,
                                                             "is_error": is_error,
                                                         })
+                                                    elif tool_name in builtin_tools:
+                                                        # Builtin tool (search_web, fetch_url, etc.) - emit as citation
+                                                        await self._emit_builtin_tool_result_source(
+                                                            emit_event_local,
+                                                            tool_name,
+                                                            tool_input,
+                                                            result_str,
+                                                            is_error=is_error,
+                                                        )
                                                     else:
-                                                        # Show completed tool result block instantly (replace, not delta)
+                                                        # User-defined tool - show in main chat as before
                                                         formatted = self._format_tool_result_block(
                                                             tool_use_id, tool_name, tool_input,
                                                             str(tool_result), is_error=is_error, done=True
@@ -5707,6 +5728,69 @@ class Pipe:
                 {
                     "source": f"code_execution_{language}_{id(code)}",
                     "name": source_name,
+                }
+            ],
+        }
+
+        await emit_event_local({"type": "source", "data": source_data})
+
+    async def _emit_builtin_tool_result_source(
+        self,
+        emit_event_local: Callable,
+        tool_name: str,
+        tool_input: dict,
+        tool_result: str,
+        is_error: bool = False,
+    ) -> None:
+        """Emit builtin tool result as a source/citation event for the citation panel.
+
+        This keeps web search and other builtin tool results out of the main chat stream
+        and displays them in the collapsible citation area instead.
+        """
+        # Format tool result for display
+        try:
+            # Try to pretty-print JSON results
+            if isinstance(tool_result, str):
+                try:
+                    parsed = json.loads(tool_result)
+                    result_display = json.dumps(parsed, indent=2, ensure_ascii=False)
+                except (json.JSONDecodeError, ValueError):
+                    result_display = tool_result
+            else:
+                result_display = json.dumps(tool_result, indent=2, ensure_ascii=False)
+        except Exception:
+            result_display = str(tool_result)
+
+        # Build source name based on tool type
+        tool_icons = {
+            "search_web": "🔍",
+            "fetch_url": "🌐",
+            "query_knowledge_files": "📚",
+            "memory_query": "🧠",
+            "memory_add": "🧠",
+        }
+        icon = tool_icons.get(tool_name, "🔧")
+
+        # Create concise summary for source name
+        if tool_name == "search_web":
+            query = tool_input.get("query", "")[:50]
+            source_name = f"{icon} Search: {query}" + ("..." if len(str(tool_input.get("query", ""))) > 50 else "")
+        elif tool_name == "fetch_url":
+            url = tool_input.get("url", "")[:60]
+            source_name = f"{icon} Fetched: {url}" + ("..." if len(str(tool_input.get("url", ""))) > 60 else "")
+        else:
+            source_name = f"{icon} Tool: {tool_name}"
+
+        source_data = {
+            "source": {
+                "name": source_name,
+            },
+            "document": [result_display],
+            "metadata": [
+                {
+                    "source": f"builtin_tool_{tool_name}_{id(tool_result)}",
+                    "name": source_name,
+                    "is_error": is_error,
                 }
             ],
         }
