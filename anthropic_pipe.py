@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/) - Azure modifications by DanCarrollAI
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.5-azure.1-minimal
+version: 0.8.5-azure.2
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -42,6 +42,16 @@ Azure Compatibility (DanCarrollAI):
 - ENABLED_MODELS valve to specify only deployed models
 
 Changelog:
+v0.8.5-azure.2
+**OpenWebUI v0.8.5 Compatibility Fix:**
+- Fixed: OpenWebUI built-in tools (search_web, fetch_url, image_generation) not executing
+  - OpenWebUI v0.8.5 introduced stricter feature flag requirements in get_builtin_tools()
+  - The pipe was only passing features={"memory": memory_enabled}, causing web tools to be filtered out
+  - Added web_search: True and image_generation: True to features dict
+  - This ensures builtin_tools dict is properly populated with callable functions for tool execution
+  - search_chats worked in v0.8.5 because it doesn't require a feature flag (backward compatibility)
+  - Root cause: features.get("web_search") was returning None instead of True
+
 v0.8.5-azure.1-minimal
 **Minimal Azure Compatibility Changes:**
 - Added ANTHROPIC_API_BASE valve for custom API endpoints
@@ -2779,7 +2789,11 @@ class Pipe:
                                 __metadata__.get("message_id") if __metadata__ else None
                             ),
                         },
-                        features={"memory": memory_enabled},
+                        features={
+                            "memory": memory_enabled,
+                            "web_search": True,  # Enable OpenWebUI web search tools
+                            "image_generation": True,  # Enable image generation tools
+                        },
                         model={},
                     )
                     logger.debug(
