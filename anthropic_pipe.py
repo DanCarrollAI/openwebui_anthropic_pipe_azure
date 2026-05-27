@@ -701,11 +701,37 @@ class Pipe:
             "supports_fast_mode": True,
         },
         "claude-opus-4-6": {
+            "max_tokens": 128000,
+            "context_length": 1000000,
+            "supports_thinking": True,
+            "supports_adaptive_thinking": True,
+            "supports_effort": True,
+            "supports_effort_max": True,
+            "supports_effort_xhigh": False,
+            "supports_memory": True,
+            "supports_vision": True,
+            "supports_programmatic_calling": True,
+            "supports_compaction": True,
             "supports_dynamic_filtering": True,
             "supports_fast_mode": True,
         },
         "claude-sonnet-4-6": {
             "supports_dynamic_filtering": True,
+        },
+        "claude-sonnet-4-5": {
+            "max_tokens": 8192,
+            "context_length": 200000,
+            "supports_thinking": True,
+            "supports_adaptive_thinking": False,
+            "supports_effort": True,
+            "supports_effort_max": False,
+            "supports_effort_xhigh": False,
+            "supports_memory": True,
+            "supports_vision": True,
+            "supports_programmatic_calling": False,
+            "supports_compaction": True,
+            "supports_dynamic_filtering": False,
+            "supports_fast_mode": False,
         },
     }
 
@@ -915,7 +941,7 @@ class Pipe:
             description="Personal Anthropic API key. If set, overrides the admin-configured key.",
         )
         ENABLE_THINKING: bool = Field(
-            default=False,
+            default=True,
             description="Enable Extended Thinking",
         )
         THINKING_BUDGET_TOKENS: int = Field(
@@ -3199,6 +3225,20 @@ class Pipe:
                     after = content[last_end:]
                     if after.strip():
                         blocks.append({"type": "text", "text": after})
+
+                    # Strip orphaned server_tool_use blocks (no matching result).
+                    # The API sometimes returns server_tool_use without results;
+                    # if these were persisted as carriers, they'd cause 400 on replay.
+                    hist_result_ids = {
+                        b.get("tool_use_id") for b in blocks
+                        if b.get("type", "").endswith("_tool_result")
+                    }
+                    blocks = [
+                        b for b in blocks
+                        if b.get("type") != "server_tool_use"
+                        or b.get("id") in hist_result_ids
+                    ]
+
                     return blocks
 
             # Only return non-empty text blocks
@@ -6361,7 +6401,22 @@ class Pipe:
         Strict key sanitization is applied ONLY to thinking/redacted_thinking
         blocks (to prevent cache_control from being sent). All other blocks
         are passed through with minimal processing.
+
+        Orphaned server_tool_use blocks (those without a matching result in
+        the same response) are stripped to prevent 400 errors on replay.
         """
+        # Pre-scan: collect tool_use_ids that have matching result blocks.
+        # The API sometimes streams server_tool_use blocks without a result
+        # (e.g. 4 server_tool_use but only 3 results before stop_reason).
+        # Replaying the orphan causes a 400 "tool_use ids without tool_result".
+        result_ids: set[str] = set()
+        for block in message.content:
+            block_type = getattr(block, "type", "")
+            if block_type.endswith("_tool_result"):
+                tid = getattr(block, "tool_use_id", None)
+                if tid:
+                    result_ids.add(tid)
+
         blocks = []
         for block in message.content:
             block_dict = block.model_dump(exclude_none=True)
@@ -6370,6 +6425,15 @@ class Pipe:
             # Skip structural meta-events (not real content blocks)
             if block_type in self._SKIP_BLOCK_TYPES:
                 continue
+
+            # Strip orphaned server_tool_use blocks (no matching result)
+            if block_type == "server_tool_use":
+                if block_dict.get("id") not in result_ids:
+                    logger.warning(
+                        f"Stripping orphaned server_tool_use {block_dict.get('id')} "
+                        f"(name={block_dict.get('name')}) — no matching result in response"
+                    )
+                    continue
 
             # Compaction: preserve as {type: "compaction"} so the API
             # recognises the boundary and drops all prior content blocks.
