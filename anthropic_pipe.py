@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.9.11
+version: 0.9.11-azure.1
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,14 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.9.11-azure.1
+- Added ENABLED_MODELS valve for Azure/custom endpoints that don't support /v1/models discovery
+- Date-suffix stripping for Azure model names (e.g. claude-sonnet-4-6-20250514 → claude-sonnet-4-6)
+- Expanded MODEL_CAPABILITY_OVERRIDES for claude-opus-4-6 (128K max_tokens, 1M context, adaptive thinking, compaction, etc.)
+- Added MODEL_CAPABILITY_OVERRIDES for claude-sonnet-4-5 (8K max_tokens, 200K context)
+- Changed ENABLE_THINKING UserValve default to True
+- Fixed orphaned server_tool_use blocks causing 400 errors on conversation replay
+
 v0.9.11
 - Added async handling for run_command <-> bash tool
 - Added all anthropic server tools as TOOL_SEARCH_EXCLUDE_TOOLS
